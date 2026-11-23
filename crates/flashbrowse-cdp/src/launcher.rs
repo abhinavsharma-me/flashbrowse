@@ -484,6 +484,18 @@ pub async fn launch_chrome(opts: LaunchOptions) -> Result<ChromeProcess, CdpErro
             });
         }
     }
+    // Windows: prevent Chromium from inheriting the CLI's own stdin/stdout/stderr
+    // pipe handles (otherwise callers using piped stdio like `Command::output()`
+    // block waiting for EOF until Chrome exits), and put persistent browsers in
+    // their own process group so Ctrl+C does not kill them.
+    #[cfg(windows)]
+    {
+        clear_stdio_inherit_flags();
+        if opts.persistent {
+            const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+        }
+    }
 
     let mut child = command.spawn().map_err(|source| CdpError::SpawnFailed {
         path: chrome_path.clone(),
@@ -543,4 +555,27 @@ pub async fn launch_chrome(opts: LaunchOptions) -> Result<ChromeProcess, CdpErro
         user_data_dir,
         owned_dir,
     })
+}
+
+#[cfg(windows)]
+fn clear_stdio_inherit_flags() {
+    const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6;
+    const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5;
+    const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4;
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    const INVALID_HANDLE_VALUE: isize = -1;
+
+    extern "system" {
+        fn GetStdHandle(n_std_handle: u32) -> isize;
+        fn SetHandleInformation(h_object: isize, dw_mask: u32, dw_flags: u32) -> i32;
+    }
+
+    for std_handle in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        unsafe {
+            let h = GetStdHandle(std_handle);
+            if h != 0 && h != INVALID_HANDLE_VALUE {
+                let _ = SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
 }

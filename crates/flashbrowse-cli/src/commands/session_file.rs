@@ -232,7 +232,10 @@ pub fn kill_pid(pid: u32) {
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/F"])
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
     }
     #[cfg(not(any(unix, windows)))]

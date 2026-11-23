@@ -11,6 +11,12 @@ All notable changes. Format: [Keep a Changelog](https://keepachangelog.com/en/1.
   GitHub Releases and replaces the running executable in place. Pass `--check`
   to only check and report without modifying the installation.
 
+### Fixed
+- Windows persistent `--session-id` launches no longer inherit the CLI's
+  stdout/stderr pipe handles, preventing callers like `Command::output()` from
+  hanging until Chromium exits. `close --session-id` now terminates the Windows
+  browser process tree cleanly (`/T`) with null stdio.
+
 ## [1.2.0] - 2026-11-23
 
 ### Added
