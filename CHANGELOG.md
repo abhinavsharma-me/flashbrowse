@@ -4,6 +4,29 @@ All notable changes. Format: [Keep a Changelog](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-23
+
+### Added
+- Child `<iframe>` accessibility trees are now spliced directly into the root
+  page AX tree in document order. Discovery walks the frame hierarchy via
+  `Page.getFrameTree` and discovers child frames, giving agents visibility and
+  action references into buttons, inputs, links, and text inside iframes (Fixes #2).
+- Out-of-process iframe (OOPIF) coordinate translation: clicks and interactions
+  targeted at child frame nodes calculate layout offsets from the frame's
+  bounding box and route clicks to their exact viewport coordinates.
+- Recursive markdown extraction: `browser_markdown` extracts content from child
+  frames and appends them in document order, including iframe titles and text.
+
+### Fixed
+- Linux persistent sessions (`--session-id`) no longer terminate when the
+  spawning CLI process exits. `PR_SET_PDEATHSIG` is skipped for persistent
+  sessions so background browser processes survive across independent command
+  invocations (Fixes #1).
+- Windows PowerShell installer (`install.ps1`) resolves the latest GitHub
+  release redirect reliably when determining the download version tag (PR #3).
+- Install documentation updated to list valid, existing installation channels
+  only (PR #4).
+
 ## [1.1.0] - 2026-11-23
 
 ### Added
