@@ -52,9 +52,9 @@ by `npm`, not by `cargo install`. So:
 | how the user gets it | quarantine? | result |
 |---|---|---|
 | `curl ... \| sh` (our `install.sh`) | no | runs, no signing needed |
-| `npm i -g flashbrowse` / `npx flashbrowse` | no | runs, no signing needed |
-| `cargo install flashbrowse` | no | compiles locally, no signing needed |
-| `brew install flashbrowse` | removed by Homebrew | runs |
+| `cargo install --git ... flashbrowse-cli` | no | compiles locally, no signing needed |
+| `npm i -g flashbrowse` (not published yet) | no | would run, no signing needed |
+| `brew install flashbrowse` (not published yet) | removed by Homebrew | would run |
 | downloaded the `.tar.gz` in a browser and extracted it | **yes** | Gatekeeper blocks it → see below |
 
 For the last case the installer already removes the attribute from the binary
@@ -66,7 +66,7 @@ equivalent for users who copy the binary by hand:
 xattr -dr com.apple.quarantine /usr/local/bin/flashbrowse
 ```
 
-**Windows:** SmartSmartScreen shows a warning for unsigned `.exe` files but
+**Windows:** SmartScreen shows a warning for unsigned `.exe` files but
 does not block them ("More info → Run anyway"). `install.ps1` calls
 `Unblock-File`, which clears the "downloaded from the internet" flag, so the
 warning does not appear for installer users. Code signing with an EV

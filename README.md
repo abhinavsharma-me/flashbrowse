@@ -49,11 +49,16 @@ flashbrowse open https://example.com       # just works
 flashbrowse mcp                            # stdio server for Claude Code / Cursor / Codex
 ```
 
-**No signing or notarization is required.** Like any normal CLI binary:
-`curl | sh`, `npm i -g flashbrowse`, `cargo install flashbrowse` and
-`brew install flashbrowse` all work out of the box. (macOS Gatekeeper only
-blocks files that a *browser* marked with the quarantine attribute; the
-installer clears it for you.) See `RELEASE.md` for the details.
+Or with Cargo, straight from this repository (flashbrowse is not on
+crates.io, npm or Homebrew yet):
+```sh
+cargo install --locked --git https://github.com/nhrbuilds/flashbrowse flashbrowse-cli
+```
+
+**No signing or notarization is required.** The install script and
+`cargo install` never set the macOS quarantine attribute (Gatekeeper only
+blocks files that a *browser* marked; the installer clears it for you). See
+`RELEASE.md` for the details.
 
 ## Build from source
 
