@@ -559,3 +559,43 @@ fn long_table_row_keeps_edit_ref_on_row_line() {
     assert!(rendered.contains(" | [1]\n"), "{rendered}");
     assert!(rendered.contains("[1] Button: \"Edit\""), "{rendered}");
 }
+
+#[tokio::test]
+async fn iframe_content_appears_in_action_tree_click_and_markdown() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        eprintln!("skipping iframe regression: no Chrome binary found");
+        return;
+    }
+    let mut session =
+        flashbrowse_core::BrowserSession::launch(flashbrowse_core::SessionConfig::default())
+            .await
+            .expect("launch Chrome");
+    let url = "data:text/html,<p>Before</p><iframe srcdoc=\"<p>IFRAME_TEXT</p><button onclick=&quot;document.body.append('FRAME_CLICKED')&quot;>IFRAME_BTN</button>\"></iframe><p>After</p>";
+    let tree = session.open(url).await.expect("open");
+
+    let body = tree.split("---\n").nth(1).unwrap_or(&tree);
+    let before = body.find("Before").expect("Before present");
+    let inside = body.find("IFRAME_TEXT").expect("IFRAME_TEXT present");
+    let btn = body
+        .find("[1] Button: \"IFRAME_BTN\"")
+        .expect("IFRAME_BTN present");
+    let after = body.find("After").expect("After present");
+    assert!(
+        before < inside && inside < btn && btn < after,
+        "iframe content out of document order:\n{tree}"
+    );
+
+    let after_click = session.click(1).await.expect("click inside iframe");
+    assert!(
+        after_click.contains("FRAME_CLICKED"),
+        "click inside iframe did not mutate frame DOM:\n{after_click}"
+    );
+
+    let md = session.extract_markdown().await.expect("extract markdown");
+    assert!(
+        md.contains("IFRAME_TEXT"),
+        "extract_markdown omitted iframe text:\n{md}"
+    );
+
+    session.shutdown().await;
+}

@@ -11,6 +11,8 @@
 
 mod cdp;
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use flashbrowse_cdp::protocol::accessibility::AXNode;
 use serde_json::Value;
@@ -19,6 +21,13 @@ use crate::resource_policy::ResourcePolicy;
 use crate::CoreError;
 
 pub use cdp::CdpDriver;
+
+/// CDP session and parent `<iframe>` owner handle for an out-of-process iframe.
+#[derive(Debug, Clone)]
+pub struct FrameSession {
+    pub session_id: String,
+    pub owner_backend: Option<i64>,
+}
 
 /// Engine-neutral browser primitives (one flattened page target).
 #[async_trait]
@@ -31,6 +40,13 @@ pub trait BrowserDriver: Send + Sync {
     async fn evaluate(&self, expression: &str) -> Result<Value, CoreError>;
     /// Fetch the full accessibility tree.
     async fn get_full_ax_tree(&self) -> Result<Vec<AXNode>, CoreError>;
+    /// Fetch the full accessibility tree plus `node_id -> FrameSession`
+    /// overrides for out-of-process iframes (OOPIFs).
+    async fn get_full_ax_tree_with_sessions(
+        &self,
+    ) -> Result<(Vec<AXNode>, HashMap<String, FrameSession>), CoreError> {
+        Ok((self.get_full_ax_tree().await?, HashMap::new()))
+    }
     /// Capture a PNG screenshot (base64).
     async fn capture_screenshot(&self, full_page: bool) -> Result<String, CoreError>;
 }
@@ -51,6 +67,12 @@ impl BrowserDriver for CdpDriver {
 
     async fn get_full_ax_tree(&self) -> Result<Vec<AXNode>, CoreError> {
         CdpDriver::get_full_ax_tree(self).await
+    }
+
+    async fn get_full_ax_tree_with_sessions(
+        &self,
+    ) -> Result<(Vec<AXNode>, HashMap<String, FrameSession>), CoreError> {
+        CdpDriver::get_full_ax_tree_with_sessions(self).await
     }
 
     async fn capture_screenshot(&self, full_page: bool) -> Result<String, CoreError> {

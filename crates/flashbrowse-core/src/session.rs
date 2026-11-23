@@ -1,5 +1,6 @@
 //! High-level browser session controller.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -11,7 +12,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::actions::fill::{backspace_event, select_all_event};
 use crate::actions::{box_center, ScrollDirection};
-use crate::driver::{BrowserDriver, CdpDriver};
+use crate::driver::{BrowserDriver, CdpDriver, FrameSession};
 use crate::engine::BrowserEngine;
 use crate::interceptor::{blocked_patterns, blocked_patterns_for_screenshot};
 use crate::markdown::EXTRACT_SCRIPT;
@@ -219,6 +220,7 @@ pub struct BrowserSession {
     driver: Box<dyn BrowserDriver>,
     net: NetActivity,
     action_map: ActionMap,
+    action_sessions: HashMap<u32, FrameSession>,
     title: String,
     url: String,
     last_tree: String,
@@ -281,6 +283,7 @@ impl BrowserSession {
             driver,
             net,
             action_map: ActionMap::new(),
+            action_sessions: HashMap::new(),
             title: String::new(),
             url: String::new(),
             last_tree: String::new(),
@@ -353,6 +356,7 @@ impl BrowserSession {
             driver,
             net,
             action_map: ActionMap::new(),
+            action_sessions: HashMap::new(),
             title: String::new(),
             url: String::new(),
             last_tree: String::new(),
@@ -463,6 +467,7 @@ impl BrowserSession {
         let mut raw_ax_nodes = 0usize;
         let mut nodes: Vec<crate::tree::SemanticNode> = Vec::new();
         let mut map = ActionMap::new();
+        let mut action_sessions: HashMap<u32, FrameSession> = HashMap::new();
         let mut fingerprint = 0u64;
 
         // Settle loop.
@@ -590,13 +595,14 @@ impl BrowserSession {
             }
 
             // (3) verify the AX tree itself
-            let fresh = self.driver.get_full_ax_tree().await?;
+            let (fresh, node_sessions) = self.driver.get_full_ax_tree_with_sessions().await?;
             let raw_ax_nodes_before = raw_ax_nodes;
             raw_ax_nodes = fresh.len();
             let (n2, m2) = compress(&fresh);
             let fp2 = tree_fingerprint(&n2, &m2);
             let ratio_ok = dom_count < 100 || (raw_ax_nodes as u64) * 4 >= dom_count;
             let same = raw_ax_nodes_before == raw_ax_nodes && fp2 == fingerprint;
+            action_sessions = build_action_sessions(&n2, &node_sessions);
             nodes = n2;
             map = m2;
             fingerprint = fp2;
@@ -657,6 +663,7 @@ impl BrowserSession {
         self.refresh_title_url().await;
         let rendered = render(&self.title, &self.url, &nodes);
         self.action_map = map;
+        self.action_sessions = action_sessions;
         self.last_tree = rendered.clone();
         tracing::debug!(
             ms = t_open.elapsed().as_millis(),
@@ -679,6 +686,7 @@ impl BrowserSession {
     /// stale action into an immediate, explicit "action not found".
     fn invalidate_tree(&mut self) {
         self.action_map.clear();
+        self.action_sessions.clear();
         self.last_tree.clear();
     }
 
@@ -747,12 +755,32 @@ impl BrowserSession {
     /// Re-fetch AXTree, recompress, re-render. Single point of rebuild so
     /// every action funnels through identical state.
     pub async fn rebuild_tree(&mut self) -> Result<String, CoreError> {
-        let raw = self.driver.get_full_ax_tree().await?;
+        let (raw, node_sessions) = self.driver.get_full_ax_tree_with_sessions().await?;
         let (nodes, map) = compress(&raw);
         let rendered = render(&self.title, &self.url, &nodes);
+        self.action_sessions = build_action_sessions(&nodes, &node_sessions);
         self.action_map = map;
         self.last_tree = rendered.clone();
         Ok(rendered)
+    }
+
+    fn frame_for_action(&self, action_id: u32) -> (String, Option<i64>) {
+        match self.action_sessions.get(&action_id) {
+            Some(fs) => (fs.session_id.clone(), fs.owner_backend),
+            None => (self.session_id.clone(), None),
+        }
+    }
+
+    async fn frame_offset(&self, owner_backend: Option<i64>) -> (f64, f64) {
+        let Some(owner) = owner_backend else {
+            return (0.0, 0.0);
+        };
+        if let Ok(resp) = dom::get_box_model(&self.client, &self.session_id, owner).await {
+            if resp.model.content.len() >= 2 {
+                return (resp.model.content[0], resp.model.content[1]);
+            }
+        }
+        (0.0, 0.0)
     }
 
     /// `click(action_id)`: scroll → box → center → mouse events → rebuild.
@@ -761,7 +789,8 @@ impl BrowserSession {
             .action_map
             .get(&action_id)
             .ok_or(CoreError::ActionNotFound(action_id))?;
-        self.click_at_backend(backend).await?;
+        let (dom_sid, owner) = self.frame_for_action(action_id);
+        self.click_at_backend(&dom_sid, owner, backend).await?;
         tokio::time::sleep(Duration::from_millis(300)).await;
         self.rebuild_tree().await
     }
@@ -772,13 +801,14 @@ impl BrowserSession {
             .action_map
             .get(&action_id)
             .ok_or(CoreError::ActionNotFound(action_id))?;
-        if let Err(e) =
-            dom::scroll_into_view_if_needed(&self.client, &self.session_id, backend).await
-        {
+        let (dom_sid, owner) = self.frame_for_action(action_id);
+        if let Err(e) = dom::scroll_into_view_if_needed(&self.client, &dom_sid, backend).await {
             tracing::warn!(backend, "scrollIntoViewIfNeeded failed (proceeding): {e}");
         }
-        let resp = dom::get_box_model(&self.client, &self.session_id, backend).await?;
-        let (x, y) = box_center(&resp.model).ok_or(CoreError::NoBoxModel(action_id))?;
+        let resp = dom::get_box_model(&self.client, &dom_sid, backend).await?;
+        let (cx, cy) = box_center(&resp.model).ok_or(CoreError::NoBoxModel(action_id))?;
+        let (ox, oy) = self.frame_offset(owner).await;
+        let (x, y) = (cx + ox, cy + oy);
         input::dispatch_mouse_event(
             &self.client,
             &self.session_id,
@@ -804,7 +834,8 @@ impl BrowserSession {
             .action_map
             .get(&action_id)
             .ok_or(CoreError::ActionNotFound(action_id))?;
-        self.click_at_backend(backend).await?;
+        let (dom_sid, owner) = self.frame_for_action(action_id);
+        self.click_at_backend(&dom_sid, owner, backend).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Select-all (down+up) then Backspace (down+up) to clear.
@@ -857,7 +888,8 @@ impl BrowserSession {
             .action_map
             .get(&action_id)
             .ok_or(CoreError::ActionNotFound(action_id))?;
-        let resolved = dom::resolve_node(&self.client, &self.session_id, backend).await?;
+        let (dom_sid, _) = self.frame_for_action(action_id);
+        let resolved = dom::resolve_node(&self.client, &dom_sid, backend).await?;
         let object_id = resolved
             .object
             .object_id
@@ -865,7 +897,7 @@ impl BrowserSession {
         let needle = serde_json::to_string(text)?;
         let resp = runtime::call_function_on(
             &self.client,
-            &self.session_id,
+            &dom_sid,
             &object_id,
             "function(want) { if (!this || this.tagName !== 'SELECT') return 'not-a-select'; for (const o of this.options) { if (o.text.trim() === want.trim() || o.value === want) { this.value = o.value; this.dispatchEvent(new Event('change', { bubbles: true })); this.dispatchEvent(new Event('input', { bubbles: true })); return 'ok:' + o.value; } } return 'no-match'; }",
             vec![serde_json::json!(needle)],
@@ -1103,17 +1135,21 @@ impl BrowserSession {
     /// Wait until `backend` is visible + stable (actionability check -
     /// Playwright-parity, beats fixed-sleep clicking). Polls box center;
     /// stable = same center twice in a row, visible = center inside viewport.
-    async fn wait_for_actionable(&self, backend: i64) -> Result<(f64, f64), CoreError> {
+    async fn wait_for_actionable(
+        &self,
+        dom_session_id: &str,
+        backend: i64,
+    ) -> Result<(f64, f64), CoreError> {
         let mut prev: Option<(f64, f64)> = None;
         let mut stable_count = 0u8;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             if let Err(e) =
-                dom::scroll_into_view_if_needed(&self.client, &self.session_id, backend).await
+                dom::scroll_into_view_if_needed(&self.client, dom_session_id, backend).await
             {
                 tracing::warn!(backend, "scrollIntoViewIfNeeded failed (proceeding): {e}");
             }
-            let resp = match dom::get_box_model(&self.client, &self.session_id, backend).await {
+            let resp = match dom::get_box_model(&self.client, dom_session_id, backend).await {
                 Ok(r) => r,
                 Err(e) => {
                     // Transient: node not in the layout tree yet.
@@ -1155,8 +1191,15 @@ impl BrowserSession {
     }
 
     /// Drive a single mouse click at the backend node's box center.
-    async fn click_at_backend(&self, backend: i64) -> Result<(), CoreError> {
-        let (x, y) = self.wait_for_actionable(backend).await?;
+    async fn click_at_backend(
+        &self,
+        dom_session_id: &str,
+        owner_backend: Option<i64>,
+        backend: i64,
+    ) -> Result<(), CoreError> {
+        let (cx, cy) = self.wait_for_actionable(dom_session_id, backend).await?;
+        let (ox, oy) = self.frame_offset(owner_backend).await;
+        let (x, y) = (cx + ox, cy + oy);
         for ty in ["mouseMoved", "mousePressed", "mouseReleased"] {
             input::dispatch_mouse_event(
                 &self.client,
@@ -1221,4 +1264,22 @@ fn tree_fingerprint(nodes: &[crate::tree::SemanticNode], map: &crate::tree::Acti
         map.get(&id).hash(&mut h);
     }
     h.finish()
+}
+
+fn build_action_sessions(
+    nodes: &[crate::tree::SemanticNode],
+    node_sessions: &HashMap<String, FrameSession>,
+) -> HashMap<u32, FrameSession> {
+    let mut out = HashMap::new();
+    if node_sessions.is_empty() {
+        return out;
+    }
+    for n in nodes {
+        if let Some(id) = n.action_id {
+            if let Some(fs) = node_sessions.get(&n.node_id) {
+                out.insert(id, fs.clone());
+            }
+        }
+    }
+    out
 }

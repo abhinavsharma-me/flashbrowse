@@ -54,6 +54,31 @@ pub async fn create_target(
         .await
 }
 
+/// Target metadata from `Target.getTargets`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetInfo {
+    pub target_id: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub url: String,
+}
+
+/// Response of `Target.getTargets`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetTargetsResponse {
+    pub target_infos: Vec<TargetInfo>,
+}
+
+/// List active CDP targets (used to discover out-of-process iframe targets).
+pub async fn get_targets(client: &CdpClient) -> Result<GetTargetsResponse, CdpError> {
+    client
+        .send_typed(None, "Target.getTargets", &serde_json::json!({}))
+        .await
+}
+
 /// Attach to a target in flatten mode. Returns `sessionId` for all page-level calls.
 pub async fn attach_to_target(
     client: &CdpClient,

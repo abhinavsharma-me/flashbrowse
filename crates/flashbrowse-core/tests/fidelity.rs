@@ -499,12 +499,14 @@ const CASES: &[Case] = &[
         markers: &[
             "Frame fixture",
             "Parent text before the frame.",
+            "Inside frame text.",
+            "Frame button",
             "Parent text after the frame.",
         ],
-        unique: &["Parent text before the frame."],
+        unique: &["Parent text before the frame.", "Inside frame text."],
         counts: &[],
         absent: &[],
-        required: &[],
+        required: &["Frame button"],
     },
     Case {
         file: "spatial.html",

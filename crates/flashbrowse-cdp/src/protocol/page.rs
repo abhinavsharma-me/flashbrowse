@@ -104,6 +104,47 @@ pub async fn enable(client: &CdpClient, session_id: &str) -> Result<(), CdpError
     Ok(())
 }
 
+/// Frame metadata in `Page.getFrameTree`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameInfo {
+    pub id: String,
+    #[serde(default)]
+    pub parent_id: Option<String>,
+    #[serde(default)]
+    pub url: String,
+}
+
+/// Recursive frame tree node returned by `Page.getFrameTree`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FrameTree {
+    pub frame: FrameInfo,
+    #[serde(default)]
+    pub child_frames: Vec<FrameTree>,
+}
+
+/// Response of `Page.getFrameTree`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetFrameTreeResponse {
+    pub frame_tree: FrameTree,
+}
+
+/// `Page.getFrameTree` - inspect main and child frames.
+pub async fn get_frame_tree(
+    client: &CdpClient,
+    session_id: &str,
+) -> Result<GetFrameTreeResponse, CdpError> {
+    client
+        .send_typed(
+            Some(session_id),
+            "Page.getFrameTree",
+            &serde_json::json!({}),
+        )
+        .await
+}
+
 /// `Page.captureScreenshot`.
 pub async fn capture_screenshot(
     client: &CdpClient,

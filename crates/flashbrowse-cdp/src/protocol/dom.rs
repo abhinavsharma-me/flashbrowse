@@ -96,6 +96,38 @@ pub async fn scroll_into_view_if_needed(
     Ok(())
 }
 
+/// Params for `DOM.getFrameOwner`.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetFrameOwnerParams {
+    pub frame_id: String,
+}
+
+/// Response of `DOM.getFrameOwner`.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GetFrameOwnerResponse {
+    #[serde(default)]
+    pub backend_node_id: Option<i64>,
+}
+
+/// `DOM.getFrameOwner` - resolve the `<iframe>` element owning `frame_id`.
+pub async fn get_frame_owner(
+    client: &CdpClient,
+    session_id: &str,
+    frame_id: &str,
+) -> Result<GetFrameOwnerResponse, CdpError> {
+    client
+        .send_typed(
+            Some(session_id),
+            "DOM.getFrameOwner",
+            &GetFrameOwnerParams {
+                frame_id: frame_id.to_string(),
+            },
+        )
+        .await
+}
+
 /// `DOM.resolveNode` - turn a backend node id into a JS object handle.
 pub async fn resolve_node(
     client: &CdpClient,

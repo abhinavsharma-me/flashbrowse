@@ -136,6 +136,8 @@ pub struct GetFullAXTreeParams {
     pub depth: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_depth: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<String>,
 }
 
 /// Response of `Accessibility.getFullAXTree`.
@@ -155,6 +157,24 @@ pub async fn get_full_ax_tree(
             Some(session_id),
             "Accessibility.getFullAXTree",
             &GetFullAXTreeParams::default(),
+        )
+        .await
+}
+
+/// `Accessibility.getFullAXTree` scoped to a specific child `frameId`.
+pub async fn get_full_ax_tree_for_frame(
+    client: &CdpClient,
+    session_id: &str,
+    frame_id: &str,
+) -> Result<GetFullAXTreeResponse, CdpError> {
+    client
+        .send_typed(
+            Some(session_id),
+            "Accessibility.getFullAXTree",
+            &GetFullAXTreeParams {
+                frame_id: Some(frame_id.to_string()),
+                ..Default::default()
+            },
         )
         .await
 }
