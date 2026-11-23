@@ -4,6 +4,13 @@ All notable changes. Format: [Keep a Changelog](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-11-23
+
+### Changed
+- `flashbrowse update` now downloads the matching platform release archive from
+  GitHub Releases and replaces the running executable in place. Pass `--check`
+  to only check and report without modifying the installation.
+
 ## [1.2.0] - 2026-11-23
 
 ### Added

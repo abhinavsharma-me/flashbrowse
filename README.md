@@ -91,8 +91,8 @@ flashbrowse doctor                   # environment diagnostics (exit 1 on failur
 flashbrowse doctor --json            # same, machine readable
 flashbrowse stats                    # latency / token / error stats from the metrics trail
 flashbrowse stats --limit 500 --json
-flashbrowse update                   # check for a newer release
-flashbrowse update --check           # report only, no install instructions
+flashbrowse update                   # download and install the latest release
+flashbrowse update --check           # check only, do not install
 ```
 
 Global flags: `--chrome-path <p>`, `--text-only`, `--full-render`,
@@ -156,8 +156,9 @@ selected with `FLASHBROWSE_UPDATE_CHANNEL`:
 | `nightly` | the latest `vX.Y.Z-nightly*` |
 | `off` | never check |
 
-The check is advisory: it prints what is available and how to install it. It
-never modifies the installation on its own.
+Without `--check`, `flashbrowse update` downloads the matching platform
+archive from GitHub Releases and replaces the running executable in place. Pass
+`--check` to only report whether a newer release is available.
 
 ### `flashbrowse doctor`
 

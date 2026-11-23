@@ -133,9 +133,9 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Check for a newer release (respects FLASHBROWSE_UPDATE_CHANNEL).
+    /// Update flashbrowse to the latest release (respects FLASHBROWSE_UPDATE_CHANNEL).
     Update {
-        /// Only report, never print install instructions.
+        /// Only check if a newer release is available without installing.
         #[arg(long)]
         check: bool,
     },

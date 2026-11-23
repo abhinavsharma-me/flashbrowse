@@ -17,6 +17,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # Only `deflate` is enabled: Chrome-for-Testing archives are deflate/store
 # only, and the AES/LZMA/Zstd decoders are attack surface we never exercise.
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
+flate2 = "1.1"
+tar = "0.4"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
@@ -31,7 +33,7 @@ async-trait = "0.1"
 url = "2.5"
 
 [workspace.package]
-version = "1.2.0"
+version = "1.2.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/nhrbuilds/flashbrowse"
