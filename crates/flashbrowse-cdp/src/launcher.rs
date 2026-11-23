@@ -50,6 +50,8 @@ pub struct LaunchOptions {
     pub user_data_dir: Option<PathBuf>,
     /// Window size `WxH`, default `1280x800`.
     pub window_size: (u32, u32),
+    /// Skip `PR_SET_PDEATHSIG` on Linux so detached persistent sessions survive CLI exit.
+    pub persistent: bool,
 }
 
 impl Default for LaunchOptions {
@@ -60,6 +62,7 @@ impl Default for LaunchOptions {
             no_sandbox: None,
             user_data_dir: None,
             window_size: (1280, 800),
+            persistent: false,
         }
     }
 }
@@ -466,18 +469,20 @@ pub async fn launch_chrome(opts: LaunchOptions) -> Result<ChromeProcess, CdpErro
             }
         });
     }
-    // Linux: kernel-enforced parent-death signal. If flashbrowse is killed
-    // (SIGTERM/SIGKILL/panic), Chromium dies with it - otherwise every
-    // interrupted run leaks a browser (measured: 573 orphans).
+    // Linux: kernel-enforced parent-death signal for ephemeral/MCP runs. If
+    // flashbrowse is killed (SIGTERM/SIGKILL/panic), Chromium dies with it.
+    // Persistent `--session-id` launches skip this so Chromium survives CLI exit.
     #[cfg(target_os = "linux")]
-    unsafe {
-        command.pre_exec(|| {
-            // PR_SET_PDEATHSIG = 1
-            if libc::prctl(1, libc::SIGKILL as libc::c_int, 0, 0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    if !opts.persistent {
+        unsafe {
+            command.pre_exec(|| {
+                // PR_SET_PDEATHSIG = 1
+                if libc::prctl(1, libc::SIGKILL as libc::c_int, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 
     let mut child = command.spawn().map_err(|source| CdpError::SpawnFailed {

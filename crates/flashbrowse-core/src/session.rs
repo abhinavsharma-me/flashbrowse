@@ -53,6 +53,8 @@ pub struct SessionConfig {
     pub no_sandbox: Option<bool>,
     /// Extra Chromium CLI args.
     pub extra_args: Vec<String>,
+    /// Keep Chromium alive after parent CLI exit (`open --session-id`).
+    pub persistent: bool,
 }
 
 impl SessionConfig {
@@ -232,6 +234,7 @@ impl BrowserSession {
             no_sandbox: config.no_sandbox,
             user_data_dir: None,
             window_size: (1280, 800),
+            persistent: config.persistent,
         })
         .await?;
         let client = Arc::new(CdpClient::connect(chrome.browser_ws_url()).await?);

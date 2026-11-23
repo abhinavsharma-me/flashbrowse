@@ -24,9 +24,15 @@ pub async fn run(
             return Err(anyhow::anyhow!("{e}"));
         }
     };
+    // Validate the session id BEFORE launching Chrome: an invalid id must not
+    // spawn a persistent browser with no session file to stop it.
+    if let Some(id) = session_id.as_deref() {
+        crate::commands::session_file::validate_session_id(id)?;
+    }
     let config = SessionConfig {
         chrome_path,
         resource_policy,
+        persistent: session_id.is_some(),
         ..Default::default()
     };
     let mut session = BrowserSession::launch(config).await?;
@@ -42,9 +48,6 @@ pub async fn run(
             let payload = (tree.len(), observability::count_actions(&tree));
             match session_id {
                 Some(id) => {
-                    // Validate the id BEFORE detaching: otherwise an invalid id
-                    // orphans a live browser with no session file to stop it.
-                    crate::commands::session_file::validate_session_id(&id)?;
                     let detached = session.detach();
                     write_session(&id, &detached)?;
                     println!("{tree}");
