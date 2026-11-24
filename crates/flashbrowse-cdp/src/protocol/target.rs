@@ -160,3 +160,15 @@ pub async fn attach_to_target(
         )
         .await
 }
+
+/// Detach an active flatten-mode session from its target.
+pub async fn detach_from_target(client: &CdpClient, session_id: &str) -> Result<(), CdpError> {
+    client
+        .send(
+            None,
+            "Target.detachFromTarget",
+            serde_json::json!({"sessionId": session_id}),
+        )
+        .await?;
+    Ok(())
+}

@@ -12,6 +12,7 @@ async fn custom_profile_and_external_cdp_attach_preserve_browser_lifecycle() {
     let mut chrome = flashbrowse_cdp::launch_chrome(LaunchOptions {
         user_data_dir: Some(profile.clone()),
         no_sandbox: Some(true),
+        persistent: true,
         ..Default::default()
     })
     .await

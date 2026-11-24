@@ -67,6 +67,13 @@ impl Default for LaunchOptions {
     }
 }
 
+/// Pipe file descriptors for `--remote-debugging-pipe` on Unix (parent read = FD 4, parent write = FD 3).
+#[cfg(unix)]
+pub struct PipeHandles {
+    pub read_fd: std::os::unix::io::OwnedFd,
+    pub write_fd: std::os::unix::io::OwnedFd,
+}
+
 /// Handle to a running Chromium process.
 ///
 /// On drop, the child is killed and reaped on a best-effort basis so CLI exit
@@ -81,6 +88,8 @@ pub struct ChromeProcess {
     /// `true` only for auto-created temp dirs - caller-supplied
     /// `--user-data-dir` is never deleted on drop (H1 fix).
     owned_dir: bool,
+    #[cfg(unix)]
+    pipe_handles: Option<PipeHandles>,
 }
 
 impl ChromeProcess {
@@ -102,6 +111,12 @@ impl ChromeProcess {
     /// OS process id.
     pub fn pid(&self) -> Option<u32> {
         self.child.as_ref().and_then(|c| c.id())
+    }
+
+    /// Take the `--remote-debugging-pipe` descriptors if launched in pipe mode.
+    #[cfg(unix)]
+    pub fn take_pipe_handles(&mut self) -> Option<PipeHandles> {
+        self.pipe_handles.take()
     }
 
     /// Kill the whole process tree (Unix: process group) and wait.
@@ -301,15 +316,16 @@ fn windows_chrome_paths() -> Vec<PathBuf> {
     out
 }
 
-/// Hardened, leak-proof Chromium flags (spec + `--user-data-dir`, `--remote-debugging-port=0`).
+/// Hardened, leak-proof Chromium flags (spec + `--user-data-dir`, `--remote-debugging-pipe` / `--remote-debugging-port=0`).
 fn hardened_args(
     user_data_dir: &std::path::Path,
     window_size: (u32, u32),
     no_sandbox: bool,
+    use_pipe: bool,
+    also_port: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "--headless=new".to_string(),
-        "--remote-debugging-port=0".to_string(),
         "--disable-gpu".to_string(),
         "--disable-dev-shm-usage".to_string(),
         "--no-first-run".to_string(),
@@ -324,6 +340,14 @@ fn hardened_args(
         format!("--window-size={},{}", window_size.0, window_size.1),
         format!("--user-data-dir={}", user_data_dir.display()),
     ];
+    if use_pipe {
+        args.push("--remote-debugging-pipe".to_string());
+        if also_port {
+            args.push("--remote-debugging-port=0".to_string());
+        }
+    } else {
+        args.push("--remote-debugging-port=0".to_string());
+    }
     if no_sandbox {
         args.push("--no-sandbox".to_string());
     }
@@ -436,9 +460,209 @@ fn cleanup_stale_profiles() {
     }
 }
 
-/// Launch headless Chromium and await its DevTools WebSocket URL.
+/// Launch headless Chromium.
+///
+/// On Unix, ephemeral/MCP launches (`!opts.persistent`) use
+/// `--remote-debugging-pipe` (falling back to WebSocket if unsupported).
+/// Persistent launches (`opts.persistent`) use WebSocket so Chromium stays
+/// alive after the spawning CLI process exits and closes its file descriptors.
 pub async fn launch_chrome(opts: LaunchOptions) -> Result<ChromeProcess, CdpError> {
     cleanup_stale_profiles();
+    #[cfg(unix)]
+    {
+        if !opts.persistent
+            && !opts
+                .extra_args
+                .iter()
+                .any(|a| a.starts_with("--remote-debugging-port"))
+        {
+            match launch_chrome_pipe(&opts).await {
+                Ok(proc) => return Ok(proc),
+                Err(err) => {
+                    tracing::warn!(%err, "pipe launch failed; falling back to WebSocket");
+                }
+            }
+        }
+    }
+    launch_chrome_ws(opts).await
+}
+
+#[cfg(unix)]
+async fn launch_chrome_pipe(opts: &LaunchOptions) -> Result<ChromeProcess, CdpError> {
+    use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
+
+    let chrome_path = find_chrome(opts.chrome_path.as_ref())?;
+    let (user_data_dir, owned_dir) = match &opts.user_data_dir {
+        Some(d) => {
+            create_dir_all(d)?;
+            (d.clone(), false)
+        }
+        None => (fresh_user_data_dir()?, true),
+    };
+    let no_sandbox = resolve_no_sandbox(opts.no_sandbox);
+    let args = hardened_args(
+        &user_data_dir,
+        opts.window_size,
+        no_sandbox,
+        true,
+        opts.persistent,
+    );
+
+    let mut to_chrome: [RawFd; 2] = [0; 2];
+    let mut from_chrome: [RawFd; 2] = [0; 2];
+    unsafe {
+        if libc::pipe(to_chrome.as_mut_ptr()) != 0 {
+            return Err(CdpError::SpawnFailed {
+                path: chrome_path,
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        if libc::pipe(from_chrome.as_mut_ptr()) != 0 {
+            let err = std::io::Error::last_os_error();
+            libc::close(to_chrome[0]);
+            libc::close(to_chrome[1]);
+            return Err(CdpError::SpawnFailed {
+                path: chrome_path,
+                source: err,
+            });
+        }
+    }
+    let child_read_fd = to_chrome[0];
+    let parent_write_fd = to_chrome[1];
+    let parent_read_fd = from_chrome[0];
+    let child_write_fd = from_chrome[1];
+
+    let mut command = Command::new(&chrome_path);
+    command
+        .args(&args)
+        .args(&opts.extra_args)
+        .stdout(Stdio::null())
+        .stderr(if opts.persistent {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+
+    let persistent = opts.persistent;
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            #[cfg(target_os = "linux")]
+            if !persistent && libc::prctl(1, libc::SIGKILL as libc::c_int, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(child_read_fd, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::dup2(child_write_fd, 4) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if child_read_fd > 4 {
+                libc::close(child_read_fd);
+            }
+            if child_write_fd > 4 {
+                libc::close(child_write_fd);
+            }
+            libc::close(parent_write_fd);
+            libc::close(parent_read_fd);
+            Ok(())
+        });
+    }
+
+    let spawn_res = command.spawn();
+    unsafe {
+        libc::close(child_read_fd);
+        libc::close(child_write_fd);
+    }
+    let mut child = match spawn_res {
+        Ok(c) => c,
+        Err(source) => {
+            unsafe {
+                libc::close(parent_write_fd);
+                libc::close(parent_read_fd);
+            }
+            if owned_dir {
+                let _ = std::fs::remove_dir_all(&user_data_dir);
+            }
+            return Err(CdpError::SpawnFailed {
+                path: chrome_path,
+                source,
+            });
+        }
+    };
+
+    let read_fd = unsafe { OwnedFd::from_raw_fd(parent_read_fd) };
+    let write_fd = unsafe { OwnedFd::from_raw_fd(parent_write_fd) };
+
+    let browser_ws_url = if opts.persistent {
+        await_devtools_ws_url(&mut child).await?
+    } else {
+        String::new()
+    };
+
+    tracing::debug!(
+        chrome = %chrome_path.display(),
+        persistent = opts.persistent,
+        "Chromium launched in pipe mode"
+    );
+
+    Ok(ChromeProcess {
+        child: Some(child),
+        browser_ws_url,
+        chrome_path,
+        user_data_dir,
+        owned_dir,
+        pipe_handles: Some(PipeHandles { read_fd, write_fd }),
+    })
+}
+
+async fn await_devtools_ws_url(child: &mut Child) -> Result<String, CdpError> {
+    let stderr = child.stderr.take().expect("stderr piped");
+    let re = devtools_regex();
+    let (tx, rx) = oneshot::channel::<String>();
+
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stderr);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    if let Some(caps) = re.captures(&line) {
+                        if let Some(m) = caps.get(1) {
+                            let _ = tx.send(m.as_str().to_string());
+                            break;
+                        }
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    match timeout(Duration::from_secs(DEVTOOLS_TIMEOUT_SECS), rx).await {
+        Ok(Ok(url)) => Ok(url),
+        Ok(Err(_)) => {
+            let code = child.try_wait().ok().flatten().and_then(|s| s.code());
+            let _ = child.kill().await;
+            Err(CdpError::ChromiumExitedEarly { code })
+        }
+        Err(_) => {
+            let _ = child.kill().await;
+            Err(CdpError::DevToolsTimeout {
+                seconds: DEVTOOLS_TIMEOUT_SECS,
+            })
+        }
+    }
+}
+
+/// Launch headless Chromium over WebSocket (`--remote-debugging-port=0`).
+pub async fn launch_chrome_ws(opts: LaunchOptions) -> Result<ChromeProcess, CdpError> {
     let chrome_path = find_chrome(opts.chrome_path.as_ref())?;
     let (user_data_dir, owned_dir) = match opts.user_data_dir {
         Some(d) => {
@@ -448,7 +672,7 @@ pub async fn launch_chrome(opts: LaunchOptions) -> Result<ChromeProcess, CdpErro
         None => (fresh_user_data_dir()?, true),
     };
     let no_sandbox = resolve_no_sandbox(opts.no_sandbox);
-    let args = hardened_args(&user_data_dir, opts.window_size, no_sandbox);
+    let args = hardened_args(&user_data_dir, opts.window_size, no_sandbox, false, false);
 
     let mut command = Command::new(&chrome_path);
     command
@@ -458,7 +682,6 @@ pub async fn launch_chrome(opts: LaunchOptions) -> Result<ChromeProcess, CdpErro
         .stderr(Stdio::piped())
         .stdin(Stdio::null())
         .kill_on_drop(true);
-    // Own process group on Unix so shutdown kills grandchildren too (H5).
     #[cfg(unix)]
     unsafe {
         command.pre_exec(|| {
@@ -469,14 +692,10 @@ pub async fn launch_chrome(opts: LaunchOptions) -> Result<ChromeProcess, CdpErro
             }
         });
     }
-    // Linux: kernel-enforced parent-death signal for ephemeral/MCP runs. If
-    // flashbrowse is killed (SIGTERM/SIGKILL/panic), Chromium dies with it.
-    // Persistent `--session-id` launches skip this so Chromium survives CLI exit.
     #[cfg(target_os = "linux")]
     if !opts.persistent {
         unsafe {
             command.pre_exec(|| {
-                // PR_SET_PDEATHSIG = 1
                 if libc::prctl(1, libc::SIGKILL as libc::c_int, 0, 0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
@@ -484,10 +703,6 @@ pub async fn launch_chrome(opts: LaunchOptions) -> Result<ChromeProcess, CdpErro
             });
         }
     }
-    // Windows: prevent Chromium from inheriting the CLI's own stdin/stdout/stderr
-    // pipe handles (otherwise callers using piped stdio like `Command::output()`
-    // block waiting for EOF until Chrome exits), and put persistent browsers in
-    // their own process group so Ctrl+C does not kill them.
     #[cfg(windows)]
     {
         clear_stdio_inherit_flags();
@@ -502,45 +717,7 @@ pub async fn launch_chrome(opts: LaunchOptions) -> Result<ChromeProcess, CdpErro
         source,
     })?;
 
-    let stderr = child.stderr.take().expect("stderr piped");
-    let re = devtools_regex();
-    let (tx, rx) = oneshot::channel::<String>();
-
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => break, // EOF
-                Ok(_) => {
-                    if let Some(caps) = re.captures(&line) {
-                        if let Some(m) = caps.get(1) {
-                            let _ = tx.send(m.as_str().to_string());
-                            break;
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let browser_ws_url = match timeout(Duration::from_secs(DEVTOOLS_TIMEOUT_SECS), rx).await {
-        Ok(Ok(url)) => url,
-        Ok(Err(_)) => {
-            // Channel died: child exited before publishing URL.
-            let code = child.try_wait().ok().flatten().and_then(|s| s.code());
-            let _ = child.kill().await;
-            return Err(CdpError::ChromiumExitedEarly { code });
-        }
-        Err(_) => {
-            let _ = child.kill().await;
-            return Err(CdpError::DevToolsTimeout {
-                seconds: DEVTOOLS_TIMEOUT_SECS,
-            });
-        }
-    };
+    let browser_ws_url = await_devtools_ws_url(&mut child).await?;
 
     tracing::debug!(
         chrome = %chrome_path.display(),
@@ -554,6 +731,8 @@ pub async fn launch_chrome(opts: LaunchOptions) -> Result<ChromeProcess, CdpErro
         chrome_path,
         user_data_dir,
         owned_dir,
+        #[cfg(unix)]
+        pipe_handles: None,
     })
 }
 

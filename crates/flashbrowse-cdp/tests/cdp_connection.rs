@@ -13,15 +13,13 @@ async fn test_cdp_connection_and_get_version() {
         eprintln!("SKIP: no Chromium binary found");
         return;
     }
-    let chrome = flashbrowse_cdp::launch_chrome(LaunchOptions::default())
+    let mut chrome = flashbrowse_cdp::launch_chrome(LaunchOptions::default())
         .await
         .expect("launch chrome");
 
-    let ws = chrome.browser_ws_url().to_string();
-    assert!(ws.starts_with("ws://127.0.0.1:"), "ws url: {ws}");
-    assert!(ws.contains("/devtools/browser/"));
-
-    let client = CdpClient::connect(&ws).await.expect("connect");
+    let client = CdpClient::connect_chrome(&mut chrome)
+        .await
+        .expect("connect");
 
     // Browser.getVersion - proves handshake + protocolVersion + product.
     let ver = browser::get_version(&client).await.expect("getVersion");
@@ -44,4 +42,23 @@ async fn test_cdp_connection_and_get_version() {
         .await
         .expect("Page.navigate");
     assert!(!nav.frame_id.is_empty());
+    client.shutdown();
+    chrome.shutdown().await;
+
+    // Persistent launch retains a WebSocket endpoint for reattachment.
+    let mut persistent = flashbrowse_cdp::launch_chrome(LaunchOptions {
+        persistent: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch persistent chrome");
+    let ws = persistent.browser_ws_url().to_string();
+    assert!(ws.starts_with("ws://127.0.0.1:"), "ws url: {ws}");
+    let ws_client = CdpClient::connect(&ws).await.expect("ws reattach");
+    let ws_ver = browser::get_version(&ws_client)
+        .await
+        .expect("ws getVersion");
+    assert!(!ws_ver.product.is_empty());
+    ws_client.shutdown();
+    persistent.shutdown().await;
 }

@@ -276,7 +276,7 @@ fn install_dialog_handler(
         ..DialogState::default()
     }));
     let mut events = client.events().subscribe("Page.javascriptDialogOpening");
-    let state_for_task = state.clone();
+    let state_for_task = Arc::downgrade(&state);
     let client = client.clone();
     let session_id = session_id.to_string();
     tokio::spawn(async move {
@@ -289,6 +289,9 @@ fn install_dialog_handler(
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             };
+            let Some(state_arc) = state_for_task.upgrade() else {
+                break;
+            };
             let dialog_type = event
                 .get("type")
                 .and_then(Value::as_str)
@@ -300,7 +303,7 @@ fn install_dialog_handler(
                 .unwrap_or_default()
                 .to_string();
             let (accepted, prompt_text) = {
-                let Ok(mut state) = state_for_task.lock() else {
+                let Ok(mut state) = state_arc.lock() else {
                     continue;
                 };
                 let (accepted, prompt_text) = match state.override_decision.take() {
@@ -322,7 +325,7 @@ fn install_dialog_handler(
                 .await;
             match response {
                 Ok(_) => {
-                    if let Ok(mut state) = state_for_task.lock() {
+                    if let Ok(mut state) = state_arc.lock() {
                         state.last_dialog = Some(DialogInfo {
                             dialog_type,
                             message,
@@ -526,7 +529,7 @@ impl BrowserSession {
                 flashbrowse_cdp::protocol::browser::resolve_websocket_url(endpoint).await?;
             return Self::attach(ws_url, None, &config).await;
         }
-        let chrome = flashbrowse_cdp::launch_chrome(LaunchOptions {
+        let mut chrome = flashbrowse_cdp::launch_chrome(LaunchOptions {
             chrome_path: config.chrome_path.clone(),
             extra_args: config.extra_args.clone(),
             no_sandbox: config.no_sandbox,
@@ -535,7 +538,7 @@ impl BrowserSession {
             persistent: config.persistent,
         })
         .await?;
-        let client = Arc::new(CdpClient::connect(chrome.browser_ws_url()).await?);
+        let client = Arc::new(CdpClient::connect_chrome(&mut chrome).await?);
         target::set_discover_targets(&client, true).await?;
         let popups = install_popup_tracker(&client);
         let t = target::create_target(&client, "about:blank").await?;
@@ -624,6 +627,16 @@ impl BrowserSession {
     ) -> Result<Self, CoreError> {
         config.validate_engine()?;
         let client = Arc::new(CdpClient::connect(&ws_url).await?);
+        Self::attach_with_client(client, ws_url, target_id, config).await
+    }
+
+    async fn attach_with_client(
+        client: Arc<CdpClient>,
+        ws_url: String,
+        target_id: Option<String>,
+        config: &SessionConfig,
+    ) -> Result<Self, CoreError> {
+        config.validate_engine()?;
         target::set_discover_targets(&client, true).await?;
         let popups = install_popup_tracker(&client);
         let tid = match target_id {
@@ -1578,9 +1591,15 @@ impl BrowserSession {
             )));
         }
         let ws_url = self.browser_ws_url.clone();
-        let mut replacement = Self::attach(ws_url, Some(target_id.to_string()), config).await?;
+        let _ = target::detach_from_target(&self.client, &self.session_id).await;
+        let mut replacement = Self::attach_with_client(
+            self.client.clone(),
+            ws_url,
+            Some(target_id.to_string()),
+            config,
+        )
+        .await?;
         replacement.chrome = self.chrome.take();
-        self.client.shutdown();
         *self = replacement;
         Ok(self.last_tree.clone())
     }
