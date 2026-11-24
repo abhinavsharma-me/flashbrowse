@@ -389,6 +389,11 @@ async fn focus_new_popup(
     existing: &std::collections::HashSet<String>,
     config: &SessionConfig,
 ) -> Result<Option<String>, flashbrowse_core::CoreError> {
+    if let Some(tab) = session.take_popup_for(opener, existing) {
+        if let Ok(tree) = session.select_tab(&tab.target_id, config).await {
+            return Ok(Some(tree));
+        }
+    }
     let tabs = session.list_tabs().await?;
     let popup = tabs.iter().rev().find(|t| {
         t.kind == "page"

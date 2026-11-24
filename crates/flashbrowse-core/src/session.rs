@@ -203,6 +203,65 @@ impl SessionConfig {
     }
 }
 
+type PopupTracker = Arc<std::sync::Mutex<Vec<target::TargetInfo>>>;
+
+fn record_popup_target(tracker: &PopupTracker, info: target::TargetInfo) {
+    if info.kind != "page" {
+        return;
+    }
+    if let Ok(mut list) = tracker.lock() {
+        if let Some(pos) = list.iter().position(|t| t.target_id == info.target_id) {
+            list[pos] = info;
+        } else {
+            list.push(info);
+        }
+    }
+}
+
+fn take_popup_from_tracker(
+    tracker: &PopupTracker,
+    opener_id: &str,
+    existing: &std::collections::HashSet<String>,
+) -> Option<target::TargetInfo> {
+    let Ok(mut list) = tracker.lock() else {
+        return None;
+    };
+    let pos = list.iter().rposition(|t| {
+        t.kind == "page"
+            && t.opener_id.as_deref() == Some(opener_id)
+            && !existing.contains(&t.target_id)
+    })?;
+    let picked = list.remove(pos);
+    list.retain(|t| t.opener_id.as_deref() != Some(opener_id) || existing.contains(&t.target_id));
+    Some(picked)
+}
+
+fn install_popup_tracker(client: &Arc<CdpClient>) -> PopupTracker {
+    let tracker: PopupTracker = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let mut created_rx = client.events().subscribe("Target.targetCreated");
+    let t_created = tracker.clone();
+    tokio::spawn(async move {
+        while let Ok(v) = created_rx.recv().await {
+            if let Ok(ev) = serde_json::from_value::<target::TargetCreatedEvent>(v) {
+                record_popup_target(&t_created, ev.target_info);
+            }
+        }
+    });
+
+    let mut attached_rx = client.events().subscribe("Target.attachedToTarget");
+    let t_attached = tracker.clone();
+    tokio::spawn(async move {
+        while let Ok(v) = attached_rx.recv().await {
+            if let Ok(ev) = serde_json::from_value::<target::AttachedToTargetEvent>(v) {
+                record_popup_target(&t_attached, ev.target_info);
+            }
+        }
+    });
+
+    tracker
+}
+
 fn settle_shadow_enabled() -> bool {
     std::env::var("FLASHBROWSE_SETTLE_SHADOW").is_ok_and(|value| value == "1")
 }
@@ -436,6 +495,7 @@ pub struct BrowserSession {
     dialog_state: Arc<std::sync::Mutex<DialogState>>,
     downloads: DownloadTracker,
     download_dir: PathBuf,
+    popups: PopupTracker,
 }
 
 /// Legacy settle result kept while the candidate is measured in shadow mode.
@@ -466,6 +526,7 @@ impl BrowserSession {
         .await?;
         let client = Arc::new(CdpClient::connect(chrome.browser_ws_url()).await?);
         target::set_discover_targets(&client, true).await?;
+        let popups = install_popup_tracker(&client);
         let t = target::create_target(&client, "about:blank").await?;
         let s = target::attach_to_target(&client, &t.target_id).await?;
         let session_id = s.session_id.clone();
@@ -533,6 +594,7 @@ impl BrowserSession {
             dialog_state,
             downloads,
             download_dir,
+            popups,
         })
     }
 
@@ -552,6 +614,7 @@ impl BrowserSession {
         config.validate_engine()?;
         let client = Arc::new(CdpClient::connect(&ws_url).await?);
         target::set_discover_targets(&client, true).await?;
+        let popups = install_popup_tracker(&client);
         let tid = match target_id {
             Some(t) => t,
             None => {
@@ -627,6 +690,7 @@ impl BrowserSession {
             dialog_state,
             downloads,
             download_dir,
+            popups,
         };
         // Wait for the popup document to finish loading and remain quiet long
         // enough for post-load hydration before creating its first action map.
@@ -1478,6 +1542,16 @@ impl BrowserSession {
             .collect())
     }
 
+    /// Consume the newest `page` target opened by `opener_id` from the
+    /// `Target.targetCreated` / `Target.attachedToTarget` event tracker.
+    pub fn take_popup_for(
+        &self,
+        opener_id: &str,
+        existing: &std::collections::HashSet<String>,
+    ) -> Option<target::TargetInfo> {
+        take_popup_from_tracker(&self.popups, opener_id, existing)
+    }
+
     pub async fn select_tab(
         &mut self,
         target_id: &str,
@@ -2187,5 +2261,42 @@ mod settle_shadow_tests {
             super::sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+}
+
+#[cfg(test)]
+mod popup_tracker_tests {
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    use flashbrowse_cdp::protocol::target::TargetInfo;
+
+    use super::{record_popup_target, take_popup_from_tracker, PopupTracker};
+
+    fn target(id: &str, kind: &str, opener: Option<&str>) -> TargetInfo {
+        TargetInfo {
+            target_id: id.to_string(),
+            kind: kind.to_string(),
+            url: format!("https://example.com/{id}"),
+            title: id.to_string(),
+            opener_id: opener.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn records_newest_page_for_opener_and_ignores_non_page_and_existing() {
+        let tracker: PopupTracker = Arc::new(Mutex::new(Vec::new()));
+        record_popup_target(&tracker, target("sw1", "service_worker", Some("opener1")));
+        record_popup_target(&tracker, target("old_tab", "page", Some("opener1")));
+        record_popup_target(&tracker, target("other", "page", Some("opener2")));
+        record_popup_target(&tracker, target("popup1", "page", Some("opener1")));
+
+        let mut existing = HashSet::new();
+        existing.insert("old_tab".to_string());
+
+        let picked = take_popup_from_tracker(&tracker, "opener1", &existing).expect("popup1");
+        assert_eq!(picked.target_id, "popup1");
+        assert!(take_popup_from_tracker(&tracker, "opener1", &existing).is_none());
+        assert!(take_popup_from_tracker(&tracker, "opener2", &existing).is_some());
     }
 }

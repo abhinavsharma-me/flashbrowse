@@ -94,6 +94,42 @@ pub async fn set_discover_targets(client: &CdpClient, discover: bool) -> Result<
     Ok(())
 }
 
+/// Enable or disable auto-attaching to new targets in flatten mode.
+pub async fn set_auto_attach(
+    client: &CdpClient,
+    auto_attach: bool,
+    wait_for_debugger_on_start: bool,
+    flatten: bool,
+) -> Result<(), CdpError> {
+    client
+        .send(
+            None,
+            "Target.setAutoAttach",
+            serde_json::json!({
+                "autoAttach": auto_attach,
+                "waitForDebuggerOnStart": wait_for_debugger_on_start,
+                "flatten": flatten,
+            }),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Payload for `Target.targetCreated` events.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TargetCreatedEvent {
+    pub target_info: TargetInfo,
+}
+
+/// Payload for `Target.attachedToTarget` events.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachedToTargetEvent {
+    pub session_id: String,
+    pub target_info: TargetInfo,
+}
+
 pub async fn close_target(client: &CdpClient, target_id: &str) -> Result<bool, CdpError> {
     let response: serde_json::Value = client
         .send(
