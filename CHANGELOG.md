@@ -4,6 +4,48 @@ All notable changes. Format: [Keep a Changelog](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-11-25
+
+### Added
+- Multi-tab and popup support: `browser_tabs` MCP tool (`list`, `select`,
+  `close`), real-time `Target.targetCreated` / `Target.attachedToTarget` popup
+  tracking with `list_tabs` recovery, delayed popup settle, and opener-first
+  fallback on close.
+- Native JavaScript dialog handling (`alert`, `confirm`, `prompt`) via
+  `Page.javascriptDialogOpening` with safe defaults so dialogs never stall
+  automation.
+- External browser attach (`--cdp-url`, `--user-data-dir`) and
+  `browser_storage_state` MCP tool for importing/exporting cookies and storage
+  state with `--storage-state-root` confinement.
+- File upload and download support (`browser_upload`, `browser_downloads`) with
+  `--file-root` path confinement.
+- `browser_fill_form` MCP tool for updating multiple form fields from one
+  starting tree and returning one authoritative refreshed tree (with completed
+  IDs reported on partial failure).
+- POSIX pipe CDP transport (`--remote-debugging-pipe`) for Flashbrowse-launched
+  Chrome on Unix with WebSocket fallback (WebSocket retained for Windows and
+  persistent `--session-id` sessions).
+- Open `shadowRoot` coverage in settle mutation tracking and
+  `browser_extract_markdown`.
+- Action references for visible non-ARIA elements with explicit click handlers
+  (`<div onclick>`, `.onclick`), preserving document order without duplicating
+  text or wrapping already-actionable elements.
+- Configurable `--stealth-profile host-native|windows` (default `host-native`)
+  stripping `HeadlessChrome` and keeping `User-Agent`, `navigator.platform`,
+  and Client Hints coherent.
+
+### Changed
+- Default session tree output now uses `render_nested` (indented hierarchy)
+  while keeping flat `render` available to explicit callers.
+- Replaced hardcoded post-action sleeps with adaptive `post_action_settle` and
+  bounded concurrent child iframe fetching (`MAX_FRAME_CONCURRENCY = 4`).
+- Switching MCP `resource_policy` now updates `Network.setBlockedURLs` on the
+  live session without restarting Chrome.
+- Sequential 15-iteration release benchmark improvements vs pre-latency
+  baseline: `cold_open_ms` p95 `1,285.7 ms -> 908.0 ms` (-29.4%),
+  `warm_open_ms` p95 `522.8 ms -> 435.2 ms` (-16.8%), and `warm_act_ms` p95
+  `445.2 ms -> 63.3 ms` (-85.8%).
+
 ## [1.3.0] - 2026-11-24
 
 ### Added

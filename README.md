@@ -8,7 +8,9 @@ Industrial-grade, single-binary, headless browser controller and token-compressi
 engine written in pure Rust - built for LLM agents.
 
 - Zero Python/Node/JVM. No Playwright/Puppeteer/Selenium shims.
-- Raw CDP JSON-RPC 2.0 over WebSocket (browser-level `flatten` sessions).
+- Raw CDP JSON-RPC 2.0 over POSIX pipe (`--remote-debugging-pipe` on Unix) or
+  WebSocket (Windows, `--cdp-url`, and persistent `--session-id` sessions),
+  using browser-level `flatten` multiplexing.
 - AXTree-first compression: **3x - 23x fewer tokens** than Playwright/Puppeteer
   accessibility snapshots (and 75-99% less than raw HTML on content pages).
 - Native MCP stdio server for Claude Code, Cursor, Codex.
@@ -96,7 +98,8 @@ flashbrowse update --check           # check only, do not install
 ```
 
 Global flags: `--chrome-path <p>`, `--text-only`, `--full-render`,
-`--resource-policy agent-default|text-only|full-render`, `--verbose`,
+`--resource-policy agent-default|text-only|full-render`,
+`--stealth-profile host-native|windows`, `--verbose`,
 `--log-format text|json`.
 
 ### Existing browser profiles and file transfer
@@ -122,6 +125,32 @@ download progress and can wait for completion or cancellation. Native
 JavaScript alerts are accepted by default; confirms and prompts are dismissed.
 Pass `dialog_action` to `browser_act` to override the next dialog, and include
 `prompt_text` only when accepting a prompt.
+
+### Multi-tab, forms, shadow DOM, and v1.4.0 improvements
+
+- **Multi-tab & popup lifecycle:** `browser_tabs` lists, selects, and closes
+  pages (rejecting closing the last tab). Popups opened by `browser_open` or
+  `browser_act` are tracked via `Target.targetCreated` / `attachedToTarget`,
+  settled automatically, and fall back to their opener when closed.
+- **Batched form filling (`browser_fill_form`):** update multiple
+  `{action_id, value}` fields from one starting tree in a single call and get
+  back one authoritative refreshed tree (or completed IDs plus the refreshed
+  tree if a field becomes unavailable mid-batch).
+- **Nested trees, open shadow roots, and clickable non-ARIA elements:**
+  sessions default to indented `render_nested` output (flat `render` remains
+  available), settle tracking and `browser_extract_markdown` traverse open
+  `shadowRoot`s, and visible non-ARIA elements with explicit click handlers
+  (`<div onclick>`, `.onclick`) receive action IDs in document order without
+  duplicating text or wrapping already-actionable buttons/links.
+- **Live policy switching & coherent stealth profiles:** changing
+  `resource_policy` in MCP updates `Network.setBlockedURLs` on the live session
+  without restarting Chrome. `--stealth-profile host-native|windows` (default
+  `host-native`) strips `HeadlessChrome` and keeps `User-Agent`,
+  `navigator.platform`, and Client Hints coherent.
+- **Transport & latency gains:** POSIX pipe transport on Unix, adaptive
+  post-action settle, and bounded concurrent child iframe fetching reduced
+  `cold_open` p95 by 29.4%, `warm_open` p95 by 16.8%, and `warm_act` p95 by
+  85.8% (`445.2 ms -> 63.3 ms`).
 
 The scheme is optional, like an address bar: `flashbrowse open example.com`
 uses `https://`, while local hosts (`localhost:3000`, `127.0.0.1`, `::1`,
@@ -294,6 +323,12 @@ Observed v1.3.0 settle improvements (matched Chrome 147, sequential warm opens):
 - **Complex & nested pages (p95):** `a11y.html` `1,370 ms -> 445 ms` (-67.5%), `forms.html` `1,365 ms -> 454 ms` (-66.7%), `nested-depth.html` `15,194 ms -> 1,364 ms` (-91.0%)
 - **Simple pages (p50 / p95):** `table.html` `499 / 551 ms -> 502 / 526 ms` (p95 -25 ms), synthetic table `506 / 564 ms -> 507 / 522 ms` (p95 -42 ms)
 - **v1.3.0 release-gate 5-minute soak:** 451 tool calls (`148` iterations), **0 errors** (`0.00%`), `p50 = 257 ms`, `drift_ratio = 1.004`, steady-state RSS `+242 kB`, **0** leaked Chrome processes at exit
+
+Observed v1.4.0 transport and action improvements (sequential 15-iteration release benchmark):
+- **Cold open (`p50 / p95`):** `1,183.7 / 1,285.7 ms -> 835.2 / 908.0 ms` (p95 -29.4%)
+- **Warm open (`p50 / p95`):** `455.8 / 522.8 ms -> 427.2 / 435.2 ms` (p95 -16.8%)
+- **Warm action (`p50 / p95`):** `414.0 / 445.2 ms -> 60.7 / 63.3 ms` (p95 -85.8%)
+- **v1.4.0 release-gate 5-minute soak:** 512 tool calls (`168` iterations), **0 errors** (`0.00%`), `p50 = 33 ms`, `p95 = 1,395 ms`, `drift_ratio = 1.065`, steady-state RSS `+200 kB`, **0** leaked Chrome processes at exit
 
 ### What is blocked, and why
 

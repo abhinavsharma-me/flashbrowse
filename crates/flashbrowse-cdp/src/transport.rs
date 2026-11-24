@@ -45,6 +45,7 @@ pub struct CdpClient {
     writer_alive: Arc<AtomicBool>,
 }
 
+#[cfg(unix)]
 fn fail_pending_oversize(pending: &PendingMap) {
     let keys: Vec<u64> = pending.iter().map(|e| *e.key()).collect();
     for key in keys {
@@ -58,6 +59,7 @@ fn fail_pending_oversize(pending: &PendingMap) {
     }
 }
 
+#[cfg(unix)]
 fn fail_pending_disconnected(pending: &PendingMap) {
     let keys: Vec<u64> = pending.iter().map(|e| *e.key()).collect();
     for key in keys {
