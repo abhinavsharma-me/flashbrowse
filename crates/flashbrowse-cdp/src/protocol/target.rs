@@ -63,6 +63,10 @@ pub struct TargetInfo {
     pub kind: String,
     #[serde(default)]
     pub url: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub opener_id: Option<String>,
 }
 
 /// Response of `Target.getTargets`.
@@ -77,6 +81,31 @@ pub async fn get_targets(client: &CdpClient) -> Result<GetTargetsResponse, CdpEr
     client
         .send_typed(None, "Target.getTargets", &serde_json::json!({}))
         .await
+}
+
+pub async fn set_discover_targets(client: &CdpClient, discover: bool) -> Result<(), CdpError> {
+    client
+        .send(
+            None,
+            "Target.setDiscoverTargets",
+            serde_json::json!({"discover": discover}),
+        )
+        .await?;
+    Ok(())
+}
+
+pub async fn close_target(client: &CdpClient, target_id: &str) -> Result<bool, CdpError> {
+    let response: serde_json::Value = client
+        .send(
+            None,
+            "Target.closeTarget",
+            serde_json::json!({"targetId": target_id}),
+        )
+        .await?;
+    Ok(response
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false))
 }
 
 /// Attach to a target in flatten mode. Returns `sessionId` for all page-level calls.

@@ -21,7 +21,7 @@ fn empty_schema() -> Value {
     serde_json::json!({"type": "object", "properties": {}})
 }
 
-/// All four tool definitions exposed via `tools/list`.
+/// Tool definitions exposed via `tools/list`.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         serde_json::json!({
@@ -77,6 +77,18 @@ pub fn tool_definitions() -> Vec<Value> {
                     "prepare_lazy_content": {"type": "boolean", "description": "Scroll the page to surface lazy-loaded images", "default": true},
                     "timeout_ms": {"type": "integer", "description": "Max ms to wait before best-effort capture (500-60000)", "default": 8000}
                 }
+            }
+        }),
+        serde_json::json!({
+            "name": "browser_tabs",
+            "description": "Lists, selects, or closes pages in the current browser session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "select", "close"]},
+                    "target_id": {"type": "string", "description": "Page target ID returned by list"}
+                },
+                "required": ["action"]
             }
         }),
     ]
@@ -180,6 +192,7 @@ pub async fn call_tool(
         "browser_extract_markdown" => call_markdown(handle).await,
         "browser_evaluate" => call_evaluate(arguments, handle).await,
         "browser_screenshot" => call_screenshot(arguments, handle).await,
+        "browser_tabs" => call_tabs(arguments, handle, default_config).await,
         other => Err(McpError::InvalidParams(format!("unknown tool '{other}'"))),
     };
     // `open` is the only tool that owns a settle; read it back from the
@@ -307,9 +320,100 @@ async fn call_open(
     let policy = arg_resource_policy(arguments, default_config)?;
     let mut guard = ensure_session(handle, default_config, policy).await?;
     let session = require_session(&mut guard)?;
+    let opener = session.target_id().to_string();
+    let existing: std::collections::HashSet<String> = session
+        .list_tabs()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.target_id)
+        .collect();
     match session.open(&url).await {
-        Ok(tree) => Ok(ToolResult::text(tree)),
+        Ok(tree) => {
+            let mut cfg = default_config.clone();
+            cfg.resource_policy = session.resource_policy();
+            match focus_new_popup(session, &opener, &existing, &cfg).await {
+                Ok(Some(popup_tree)) => Ok(ToolResult::text(popup_tree)),
+                Ok(None) => Ok(ToolResult::text(tree)),
+                Err(e) => Ok(ToolResult::error(e.to_string())),
+            }
+        }
         Err(e) => Ok(ToolResult::error(e.to_string())),
+    }
+}
+
+async fn focus_new_popup(
+    session: &mut BrowserSession,
+    opener: &str,
+    existing: &std::collections::HashSet<String>,
+    config: &SessionConfig,
+) -> Result<Option<String>, flashbrowse_core::CoreError> {
+    let tabs = session.list_tabs().await?;
+    let popup = tabs.iter().rev().find(|t| {
+        t.kind == "page"
+            && t.opener_id.as_deref() == Some(opener)
+            && !existing.contains(&t.target_id)
+    });
+    match popup {
+        Some(tab) => session.select_tab(&tab.target_id, config).await.map(Some),
+        None => Ok(None),
+    }
+}
+
+async fn call_tabs(
+    arguments: &Value,
+    handle: &SessionHandle,
+    default_config: &SessionConfig,
+) -> Result<ToolResult, McpError> {
+    let action = arg_string(arguments, "action")?;
+    let mut guard = handle.lock().await;
+    let session = require_session(&mut guard)?;
+    let mut config = default_config.clone();
+    config.resource_policy = session.resource_policy();
+    match action.as_str() {
+        "list" => {
+            let active = session.target_id().to_string();
+            let tabs = session
+                .list_tabs()
+                .await
+                .map_err(|e| McpError::Internal(e.to_string()))?;
+            let rows: Vec<Value> = tabs
+                .into_iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "target_id": t.target_id,
+                        "title": t.title,
+                        "url": t.url,
+                        "active": t.target_id == active
+                    })
+                })
+                .collect();
+            Ok(ToolResult::text(
+                serde_json::to_string(&rows).unwrap_or_default(),
+            ))
+        }
+        "select" => {
+            let id = arg_string(arguments, "target_id")?;
+            session
+                .select_tab(&id, &config)
+                .await
+                .map(ToolResult::text)
+                .map_err(|e| McpError::InvalidParams(e.to_string()))
+        }
+        "close" => {
+            let id = arg_string(arguments, "target_id")?;
+            session
+                .close_tab(&id, &config)
+                .await
+                .map(|tree| {
+                    tree.map(ToolResult::text)
+                        .unwrap_or_else(|| ToolResult::text("Tab closed".to_string()))
+                })
+                .map_err(|e| McpError::InvalidParams(e.to_string()))
+        }
+        _ => Err(McpError::InvalidParams(
+            "action must be list, select, or close".into(),
+        )),
     }
 }
 
@@ -334,6 +438,14 @@ async fn call_act(
     // Touch default_config so the launch path stays explicit for future use.
     let _ = default_config;
     let session = guard.as_mut().expect("session present");
+    let opener = session.target_id().to_string();
+    let existing: std::collections::HashSet<String> = session
+        .list_tabs()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|t| t.target_id)
+        .collect();
 
     let result = match action.as_str() {
         "click" => session.click(action_id).await,
@@ -389,7 +501,15 @@ async fn call_act(
         }
     };
     match result {
-        Ok(tree) => Ok(ToolResult::text(tree)),
+        Ok(tree) => {
+            let mut config = default_config.clone();
+            config.resource_policy = session.resource_policy();
+            match focus_new_popup(session, &opener, &existing, &config).await {
+                Ok(Some(popup_tree)) => Ok(ToolResult::text(popup_tree)),
+                Ok(None) => Ok(ToolResult::text(tree)),
+                Err(e) => Ok(ToolResult::error(e.to_string())),
+            }
+        }
         Err(e) => Ok(ToolResult::error(e.to_string())),
     }
 }

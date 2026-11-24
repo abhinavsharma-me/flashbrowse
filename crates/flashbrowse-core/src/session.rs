@@ -254,6 +254,7 @@ impl BrowserSession {
         })
         .await?;
         let client = Arc::new(CdpClient::connect(chrome.browser_ws_url()).await?);
+        target::set_discover_targets(&client, true).await?;
         let t = target::create_target(&client, "about:blank").await?;
         let s = target::attach_to_target(&client, &t.target_id).await?;
         let session_id = s.session_id.clone();
@@ -324,6 +325,7 @@ impl BrowserSession {
     ) -> Result<Self, CoreError> {
         config.validate_engine()?;
         let client = Arc::new(CdpClient::connect(&ws_url).await?);
+        target::set_discover_targets(&client, true).await?;
         let tid = match target_id {
             Some(t) => t,
             None => {
@@ -385,12 +387,54 @@ impl BrowserSession {
             last_tree: String::new(),
             last_settle: None,
         };
+        // Wait for the popup document to finish loading and remain quiet long
+        // enough for post-load hydration before creating its first action map.
+        sess.wait_for_popup_settle().await;
         // Seed title/url + action_map so `act` never uses a blank map.
         // Propagate failures (H6): a blank map must not masquerade as
         // "ActionNotFound" later.
         sess.refresh_title_url().await;
         sess.rebuild_tree().await?;
         Ok(sess)
+    }
+
+    async fn wait_for_popup_settle(&self) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut previous = None;
+        let mut stable_since = std::time::Instant::now();
+        loop {
+            let state = self
+                .driver
+                .evaluate("document.readyState + '|' + document.getElementsByTagName('*').length + '|' + (document.body ? document.body.innerText.length : 0)")
+                .await
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string));
+            let now = std::time::Instant::now();
+            if let Some(state) = state {
+                let mut parts = state.split('|');
+                let complete = parts.next() == Some("complete");
+                let dom_signature = (
+                    parts.next().and_then(|v| v.parse::<usize>().ok()),
+                    parts.next().and_then(|v| v.parse::<usize>().ok()),
+                );
+                if !complete {
+                    previous = None;
+                    stable_since = now;
+                } else if previous != Some(dom_signature) {
+                    previous = Some(dom_signature);
+                    stable_since = now;
+                } else if now.duration_since(stable_since) >= Duration::from_millis(1200) {
+                    break;
+                }
+            } else {
+                previous = None;
+                stable_since = now;
+            }
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Browser-level WebSocket URL (for session files).
@@ -1016,6 +1060,76 @@ impl BrowserSession {
     /// CDP `Target` id backing this page.
     pub fn target_id(&self) -> &str {
         &self.target_id
+    }
+
+    pub async fn list_tabs(&self) -> Result<Vec<target::TargetInfo>, CoreError> {
+        let targets = target::get_targets(&self.client).await?;
+        Ok(targets
+            .target_infos
+            .into_iter()
+            .filter(|t| t.kind == "page")
+            .collect())
+    }
+
+    pub async fn select_tab(
+        &mut self,
+        target_id: &str,
+        config: &SessionConfig,
+    ) -> Result<String, CoreError> {
+        if target_id == self.target_id {
+            return Ok(self.last_tree.clone());
+        }
+        let tabs = self.list_tabs().await?;
+        if !tabs.iter().any(|t| t.target_id == target_id) {
+            return Err(CoreError::NavigationFailed(format!(
+                "unknown page target: {target_id}"
+            )));
+        }
+        let ws_url = self.browser_ws_url.clone();
+        let mut replacement = Self::attach(ws_url, Some(target_id.to_string()), config).await?;
+        replacement.chrome = self.chrome.take();
+        self.client.shutdown();
+        *self = replacement;
+        Ok(self.last_tree.clone())
+    }
+
+    pub async fn close_tab(
+        &mut self,
+        target_id: &str,
+        config: &SessionConfig,
+    ) -> Result<Option<String>, CoreError> {
+        let tabs = self.list_tabs().await?;
+        if tabs.len() <= 1 {
+            return Err(CoreError::NavigationFailed(
+                "cannot close the last browser tab".into(),
+            ));
+        }
+        if !tabs.iter().any(|t| t.target_id == target_id) {
+            return Err(CoreError::NavigationFailed(format!(
+                "unknown page target: {target_id}"
+            )));
+        }
+        if !target::close_target(&self.client, target_id).await? {
+            return Err(CoreError::NavigationFailed(format!(
+                "Chrome refused to close page target: {target_id}"
+            )));
+        }
+        if target_id == self.target_id {
+            let opener_id = tabs
+                .iter()
+                .find(|t| t.target_id == target_id)
+                .and_then(|t| t.opener_id.as_deref());
+            let next = opener_id
+                .and_then(|oid| tabs.iter().find(|t| t.target_id == oid))
+                .or_else(|| {
+                    tabs.iter()
+                        .find(|t| t.target_id != target_id && !t.url.starts_with("chrome://"))
+                })
+                .or_else(|| tabs.iter().find(|t| t.target_id != target_id))
+                .expect("remaining tab");
+            return self.select_tab(&next.target_id, config).await.map(Some);
+        }
+        Ok(None)
     }
 
     pub fn resource_policy(&self) -> ResourcePolicy {

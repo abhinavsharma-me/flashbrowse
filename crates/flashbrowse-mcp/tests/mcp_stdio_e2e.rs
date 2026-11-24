@@ -81,7 +81,7 @@ async fn test_mcp_stdio_e2e() {
         .and_then(|r| r.get("tools"))
         .and_then(|t| t.as_array())
         .expect("tools list");
-    assert_eq!(tools.len(), 5);
+    assert_eq!(tools.len(), 6);
     let names: Vec<String> = tools
         .iter()
         .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(str::to_string))
@@ -92,6 +92,7 @@ async fn test_mcp_stdio_e2e() {
         "browser_extract_markdown",
         "browser_evaluate",
         "browser_screenshot",
+        "browser_tabs",
     ] {
         assert!(names.contains(&want.to_string()), "missing tool {want}");
     }
@@ -163,11 +164,71 @@ async fn test_mcp_stdio_e2e() {
         "screenshot should be image content: {first}"
     );
 
+    // Opening a popup by user gesture focuses it and leaves the opener selectable.
+    let popup_page = "data:text/html,<html><body><button onclick=\"const w=window.open('about:blank');w.document.body.innerHTML='<h1>Popup content</h1>'\">Open popup</button></body></html>";
+    let resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":popup_page}}}),
+    ).await;
+    assert!(tool_text(&resp).contains("Open popup"));
+    let resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"browser_act","arguments":{"action_id":1,"action":"click"}}}),
+    ).await;
+    assert!(
+        tool_text(&resp).contains("Popup content"),
+        "popup was not focused: {resp}"
+    );
+
+    let resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"browser_tabs","arguments":{"action":"list"}}}),
+    ).await;
+    let tabs: Value = serde_json::from_str(&tool_text(&resp)).expect("tab list JSON");
+    let tabs = tabs.as_array().expect("tab list array");
+    assert!(tabs.len() >= 2, "expected opener and popup: {tabs:?}");
+    let popup_id = tabs
+        .iter()
+        .find(|t| t.get("active").and_then(Value::as_bool) == Some(true))
+        .and_then(|t| t.get("target_id"))
+        .and_then(Value::as_str)
+        .expect("active popup target id")
+        .to_string();
+    let opener_id = tabs
+        .iter()
+        .find(|t| {
+            t.get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|u| u.contains("Open popup"))
+        })
+        .and_then(|t| t.get("target_id"))
+        .and_then(Value::as_str)
+        .expect("opener target id")
+        .to_string();
+    let resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"browser_tabs","arguments":{"action":"select","target_id":opener_id}}}),
+    ).await;
+    assert!(
+        tool_text(&resp).contains("Open popup"),
+        "failed to return to opener: {resp}"
+    );
+    let resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"browser_tabs","arguments":{"action":"close","target_id":popup_id}}}),
+    ).await;
+    assert_tool_ok(&resp);
+
     // ping → result
     let resp = roundtrip(
         &mut client_out,
         &mut client_lines,
-        serde_json::json!({"jsonrpc": "2.0", "id": 10, "method": "ping", "params": {}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 15, "method": "ping", "params": {}}),
     )
     .await;
     assert!(resp.get("error").is_none());
@@ -176,6 +237,145 @@ async fn test_mcp_stdio_e2e() {
     drop(client_out);
     drop(client_lines);
     server.await.expect("server task");
+}
+
+#[tokio::test]
+async fn test_mcp_delayed_http_popup_and_opener_fallback() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        eprintln!("SKIP: no Chromium binary found");
+        return;
+    }
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local test server");
+    let port = listener.local_addr().unwrap().port();
+    let base_url = format!("http://127.0.0.1:{port}/");
+
+    let http_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let path = req
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let body = if path == "/slow-popup" {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    "<html><head><title>Slow Popup</title></head><body><h1>Delayed HTTP Popup</h1><button onclick=\"document.body.append('popup-ok')\">Popup Btn</button><script>setTimeout(() => { const p = document.createElement('p'); p.textContent = 'Late Hydrated Popup Content'; document.body.append(p); }, 800)</script></body></html>"
+                } else {
+                    "<html><head><title>Opener Page</title></head><body><h1>Main Opener</h1><a href=\"/slow-popup\" target=\"_blank\">Open Delayed Popup</a></body></html>"
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            });
+        }
+    });
+
+    let (server_in, mut client_out) = duplex(64 * 1024);
+    let (server_out, client_in) = duplex(64 * 1024);
+    let mut client_lines = BufReader::new(client_in);
+
+    let server = tokio::spawn(async move {
+        serve(server_in, server_out, SessionConfig::default())
+            .await
+            .expect("serve");
+    });
+
+    let _ = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0.1"}}
+        }),
+    )
+    .await;
+    client_out
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .unwrap();
+
+    let resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":base_url}}}),
+    )
+    .await;
+    assert!(tool_text(&resp).contains("Main Opener"), "{resp}");
+
+    // Click <a target="_blank"> pointing to a 400ms-delayed HTTP endpoint.
+    let resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_act","arguments":{"action_id":1,"action":"click"}}}),
+    )
+    .await;
+    assert!(
+        tool_text(&resp).contains("Delayed HTTP Popup"),
+        "delayed HTTP popup was not focused/settled: {resp}"
+    );
+    assert!(
+        tool_text(&resp).contains("Late Hydrated Popup Content"),
+        "popup tree was returned before late hydration completed: {resp}"
+    );
+
+    // Act inside the newly-focused HTTP popup.
+    let resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"browser_act","arguments":{"action_id":1,"action":"click"}}}),
+    )
+    .await;
+    assert!(
+        tool_text(&resp).contains("popup-ok"),
+        "act inside delayed popup failed: {resp}"
+    );
+
+    // Closing the active popup must deterministically return to its opener (not chrome://newtab).
+    let list_resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"browser_tabs","arguments":{"action":"list"}}}),
+    )
+    .await;
+    let tabs: Value = serde_json::from_str(&tool_text(&list_resp)).expect("tab list");
+    let popup_id = tabs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t.get("active").and_then(Value::as_bool) == Some(true))
+        .and_then(|t| t.get("target_id"))
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    let close_resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"browser_tabs","arguments":{"action":"close","target_id":popup_id}}}),
+    )
+    .await;
+    assert!(
+        tool_text(&close_resp).contains("Main Opener"),
+        "closing active popup did not return to opener: {close_resp}"
+    );
+
+    drop(client_out);
+    drop(client_lines);
+    server.await.expect("server task");
+    http_task.abort();
 }
 
 fn tool_text(resp: &Value) -> String {
