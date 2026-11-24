@@ -2,12 +2,13 @@
 
 use std::path::PathBuf;
 
-use flashbrowse_core::{ResourcePolicy, SessionConfig};
+use flashbrowse_core::{ResourcePolicy, SessionConfig, StealthProfile};
 
 /// Run the MCP server on stdio until stdin closes.
 pub async fn run(
     chrome_path: Option<PathBuf>,
     resource_policy: ResourcePolicy,
+    stealth_profile: StealthProfile,
     cdp_url: Option<String>,
     user_data_dir: Option<PathBuf>,
     storage_state_root: Option<PathBuf>,
@@ -16,6 +17,7 @@ pub async fn run(
     let config = SessionConfig {
         chrome_path,
         resource_policy,
+        stealth_profile,
         cdp_url,
         user_data_dir,
         storage_state_root,

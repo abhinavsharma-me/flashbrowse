@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use flashbrowse_core::{
     compress_with_options, normalize_url, render, render_nested, BrowserSession, CompressOptions,
-    ResourcePolicy, SessionConfig,
+    ResourcePolicy, SessionConfig, StealthProfile,
 };
 
 use flashbrowse_core::observability;
@@ -18,6 +18,7 @@ pub async fn run(
     no_prune: bool,
     chrome_path: Option<PathBuf>,
     resource_policy: ResourcePolicy,
+    stealth_profile: StealthProfile,
 ) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     match format.as_str() {
@@ -38,6 +39,7 @@ pub async fn run(
     let config = SessionConfig {
         chrome_path,
         resource_policy,
+        stealth_profile,
         ..Default::default()
     };
     let mut session = BrowserSession::launch(config).await?;

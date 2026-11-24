@@ -52,6 +52,10 @@ struct Cli {
     #[arg(long, global = true)]
     resource_policy: Option<String>,
 
+    /// Stealth User-Agent/platform/Client-Hints profile: `host-native` (default) or `windows`.
+    #[arg(long, global = true, default_value = "host-native", value_parser = ["host-native", "windows"])]
+    stealth_profile: String,
+
     /// Enable debug logging to stderr.
     #[arg(short, long, global = true)]
     verbose: bool,
@@ -181,6 +185,10 @@ async fn main() -> anyhow::Result<()> {
         .log_format
         .parse::<flashbrowse_core::observability::LogFormat>()
         .map_err(|e| anyhow::anyhow!(e))?;
+    let stealth_profile = cli
+        .stealth_profile
+        .parse::<flashbrowse_core::StealthProfile>()
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Stderr-only logging; stdout stays pure (critical for `mcp`).
     // With `--log-format json` every tracing line is a JSON object too, so a
@@ -249,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
                 commands::mcp::run(
                     cli.chrome_path,
                     resource_policy,
+                    stealth_profile,
                     cdp_url,
                     user_data_dir,
                     storage_state_root,
@@ -267,6 +276,7 @@ async fn main() -> anyhow::Result<()> {
                     session_id,
                     cli.chrome_path,
                     resource_policy,
+                    stealth_profile,
                     cdp_url,
                     user_data_dir,
                 )
@@ -282,9 +292,19 @@ async fn main() -> anyhow::Result<()> {
                 url,
                 format,
                 no_prune,
-            } => commands::dump::run(url, format, no_prune, cli.chrome_path, resource_policy).await,
+            } => {
+                commands::dump::run(
+                    url,
+                    format,
+                    no_prune,
+                    cli.chrome_path,
+                    resource_policy,
+                    stealth_profile,
+                )
+                .await
+            }
             Commands::Bench { urls } => {
-                commands::bench::run(urls, cli.chrome_path, resource_policy).await
+                commands::bench::run(urls, cli.chrome_path, resource_policy, stealth_profile).await
             }
             Commands::Setup { force } => commands::setup::run(force).await,
             Commands::Doctor { json } => {

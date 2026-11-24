@@ -5,7 +5,9 @@ use std::time::Instant;
 
 use flashbrowse_cdp::protocol::runtime;
 use flashbrowse_core::observability;
-use flashbrowse_core::{normalize_url, BrowserSession, ResourcePolicy, SessionConfig};
+use flashbrowse_core::{
+    normalize_url, BrowserSession, ResourcePolicy, SessionConfig, StealthProfile,
+};
 
 /// Standard default targets (kept network-minimal for CI speed).
 const DEFAULT_URLS: &[&str] = &["https://example.com"];
@@ -38,6 +40,7 @@ pub async fn run(
     urls: Vec<String>,
     chrome_path: Option<PathBuf>,
     resource_policy: ResourcePolicy,
+    stealth_profile: StealthProfile,
 ) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     let targets: Vec<String> = if urls.is_empty() {
@@ -80,7 +83,7 @@ pub async fn run(
     let mut any_fail = false;
     let mut last_settle = None;
     for url in &targets {
-        match bench_one(url, chrome_path.clone(), resource_policy).await {
+        match bench_one(url, chrome_path.clone(), resource_policy, stealth_profile).await {
             Ok(row) => {
                 last_settle = row.settle.clone();
                 println!(
@@ -154,10 +157,12 @@ async fn bench_one(
     url: &str,
     chrome_path: Option<PathBuf>,
     resource_policy: ResourcePolicy,
+    stealth_profile: StealthProfile,
 ) -> anyhow::Result<BenchRow> {
     let config = SessionConfig {
         chrome_path,
         resource_policy,
+        stealth_profile,
         ..Default::default()
     };
     let start = Instant::now();

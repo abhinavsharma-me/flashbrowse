@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use flashbrowse_cdp::protocol::{dom, input, network, page, runtime, target};
+use flashbrowse_cdp::protocol::{browser, dom, input, network, page, runtime, target};
 use flashbrowse_cdp::{CdpClient, CdpError, ChromeProcess, LaunchOptions};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -17,7 +17,9 @@ use crate::engine::BrowserEngine;
 use crate::interceptor::{blocked_patterns, blocked_patterns_for_screenshot};
 use crate::markdown::EXTRACT_SCRIPT;
 use crate::resource_policy::ResourcePolicy;
-use crate::stealth::{SETTLE_DIAGNOSTICS_SCRIPT, STEALTH_SCRIPT};
+use crate::stealth::{
+    build_ua_override, stealth_script, StealthProfile, SETTLE_DIAGNOSTICS_SCRIPT,
+};
 use crate::tree::{compress, render_nested, ActionMap};
 
 const SETTLE_DOM_STATS_JS: &str = r#"(() => {
@@ -83,6 +85,8 @@ pub struct SessionConfig {
     pub storage_state_root: Option<PathBuf>,
     /// Root for MCP upload inputs and browser downloads.
     pub mcp_file_root: Option<PathBuf>,
+    /// Stealth User-Agent/platform/Client-Hints profile (`host-native` default).
+    pub stealth_profile: StealthProfile,
 }
 
 /// Native JavaScript dialog handling policy.
@@ -281,6 +285,19 @@ fn install_popup_tracker(client: &Arc<CdpClient>) -> PopupTracker {
 
 fn settle_shadow_enabled() -> bool {
     std::env::var("FLASHBROWSE_SETTLE_SHADOW").is_ok_and(|value| value == "1")
+}
+
+async fn apply_stealth_profile(
+    client: &Arc<CdpClient>,
+    session_id: &str,
+    profile: StealthProfile,
+) -> Result<(), CoreError> {
+    let version = browser::get_version(client).await?;
+    let params = build_ua_override(version.user_agent.as_deref().unwrap_or(""), profile);
+    let _: Value = client
+        .send(Some(session_id), "Emulation.setUserAgentOverride", params)
+        .await?;
+    Ok(())
 }
 
 fn install_dialog_handler(
@@ -589,14 +606,19 @@ impl BrowserSession {
         page::set_download_behavior(&client, &session_id, &download_dir.to_string_lossy()).await?;
         let _: Value = acc_r.unwrap_or(serde_json::json!({}));
 
-        let (_, _) = tokio::join!(
-            page::add_script_on_new_document(&client, &session_id, STEALTH_SCRIPT),
+        let stealth_js = stealth_script(config.stealth_profile);
+        let (s_r, b_r, u_r) = tokio::join!(
+            page::add_script_on_new_document(&client, &session_id, &stealth_js),
             network::set_blocked_urls(
                 &client,
                 &session_id,
                 blocked_patterns(config.resource_policy),
-            )
+            ),
+            apply_stealth_profile(&client, &session_id, config.stealth_profile),
         );
+        s_r?;
+        b_r?;
+        u_r?;
         if settle_shadow_enabled() {
             page::add_script_on_new_document(&client, &session_id, SETTLE_DIAGNOSTICS_SCRIPT)
                 .await?;
@@ -694,16 +716,19 @@ impl BrowserSession {
         let _: Value = a_r.unwrap_or(serde_json::json!({}));
 
         // Per-session settings: always re-apply (parallel).
-        let (s_r, b_r) = tokio::join!(
-            page::add_script_on_new_document(&client, &session_id, STEALTH_SCRIPT),
+        let stealth_js = stealth_script(config.stealth_profile);
+        let (s_r, b_r, u_r) = tokio::join!(
+            page::add_script_on_new_document(&client, &session_id, &stealth_js),
             network::set_blocked_urls(
                 &client,
                 &session_id,
                 blocked_patterns(config.resource_policy),
-            )
+            ),
+            apply_stealth_profile(&client, &session_id, config.stealth_profile),
         );
         s_r?;
         b_r?;
+        u_r?;
         if settle_shadow_enabled() {
             page::add_script_on_new_document(&client, &session_id, SETTLE_DIAGNOSTICS_SCRIPT)
                 .await?;
@@ -1666,6 +1691,17 @@ impl BrowserSession {
 
     pub fn resource_policy(&self) -> ResourcePolicy {
         self.resource_policy
+    }
+
+    /// Update the active resource policy via `Network.setBlockedURLs` without
+    /// restarting the browser. Only updates session state after CDP succeeds.
+    pub async fn set_resource_policy(&mut self, policy: ResourcePolicy) -> Result<(), CoreError> {
+        if self.resource_policy == policy {
+            return Ok(());
+        }
+        self.driver.set_resource_policy(policy).await?;
+        self.resource_policy = policy;
+        Ok(())
     }
 
     /// Whether text-only AV blocking is active.

@@ -25,6 +25,7 @@ pub use session::{
     BrowserSession, CoreError, DetachedSession, DialogInfo, DialogPolicy, ScreenshotOptions,
     SessionConfig, SCREENSHOT_PREPARE_MS_DEFAULT, SCREENSHOT_PREPARE_MS_MAX,
 };
+pub use stealth::StealthProfile;
 pub use tree::{
     compress_with_options, render, render_nested, ActionMap, CompressOptions, SemanticNode,
 };

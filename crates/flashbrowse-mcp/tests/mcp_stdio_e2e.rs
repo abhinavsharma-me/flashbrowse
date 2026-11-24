@@ -707,6 +707,81 @@ async fn test_mcp_storage_state_import_export() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+#[tokio::test]
+async fn test_mcp_live_policy_switch_preserves_browser_session() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        eprintln!("SKIP: no Chromium binary found");
+        return;
+    }
+
+    let (server_in, mut client_out) = duplex(64 * 1024);
+    let (server_out, client_in) = duplex(64 * 1024);
+    let mut client_lines = BufReader::new(client_in);
+    let server = tokio::spawn(async move {
+        serve(server_in, server_out, SessionConfig::default())
+            .await
+            .expect("serve")
+    });
+    let init = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}),
+    ).await;
+    assert!(init.get("error").is_none(), "initialize failed: {init}");
+
+    let open1 = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":"data:text/html,<h1>First</h1>","resource_policy":"agent-default"}}}),
+    ).await;
+    assert_tool_ok(&open1);
+
+    let tabs1 = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_tabs","arguments":{"action":"list"}}}),
+    ).await;
+    assert_tool_ok(&tabs1);
+    let tabs1_json: Value = serde_json::from_str(&tool_text(&tabs1)).expect("tabs1 json");
+    let first_tid = tabs1_json
+        .as_array()
+        .and_then(|arr| arr.iter().find(|t| t["active"] == true))
+        .and_then(|t| t["target_id"].as_str())
+        .expect("active target_id")
+        .to_string();
+
+    let open2 = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":"data:text/html,<h1>Second</h1>","resource_policy":"full-render"}}}),
+    ).await;
+    assert_tool_ok(&open2);
+    assert!(tool_text(&open2).contains("Second"));
+
+    let tabs2 = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"browser_tabs","arguments":{"action":"list"}}}),
+    ).await;
+    assert_tool_ok(&tabs2);
+    let tabs2_json: Value = serde_json::from_str(&tool_text(&tabs2)).expect("tabs2 json");
+    let second_tid = tabs2_json
+        .as_array()
+        .and_then(|arr| arr.iter().find(|t| t["active"] == true))
+        .and_then(|t| t["target_id"].as_str())
+        .expect("active target_id")
+        .to_string();
+
+    assert_eq!(
+        first_tid, second_tid,
+        "switching resource_policy must update live session without restarting Chrome"
+    );
+
+    drop(client_out);
+    drop(client_lines);
+    server.await.expect("MCP server");
+}
+
 fn tool_text(resp: &Value) -> String {
     resp.get("result")
         .and_then(|r| r.get("content"))

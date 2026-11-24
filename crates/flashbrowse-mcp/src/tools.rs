@@ -211,14 +211,12 @@ async fn ensure_session<'a>(
     want_policy: ResourcePolicy,
 ) -> Result<tokio::sync::MutexGuard<'a, Option<BrowserSession>>, McpError> {
     let mut guard = handle.lock().await;
-    let needs_relaunch = match guard.as_ref() {
-        Some(s) => s.resource_policy() != want_policy,
-        None => true,
-    };
-    if needs_relaunch {
-        if let Some(old) = guard.take() {
-            old.shutdown().await;
-        }
+    if let Some(session) = guard.as_mut() {
+        session
+            .set_resource_policy(want_policy)
+            .await
+            .map_err(|e| McpError::Internal(e.to_string()))?;
+    } else {
         let mut cfg = default_config.clone();
         cfg.resource_policy = want_policy;
         let fresh = BrowserSession::launch(cfg)

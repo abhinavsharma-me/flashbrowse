@@ -2,7 +2,9 @@
 
 use std::path::PathBuf;
 
-use flashbrowse_core::{normalize_url, BrowserSession, ResourcePolicy, SessionConfig};
+use flashbrowse_core::{
+    normalize_url, BrowserSession, ResourcePolicy, SessionConfig, StealthProfile,
+};
 
 use super::session_file::write_session;
 use flashbrowse_core::observability;
@@ -13,6 +15,7 @@ pub async fn run(
     session_id: Option<String>,
     chrome_path: Option<PathBuf>,
     resource_policy: ResourcePolicy,
+    stealth_profile: StealthProfile,
     cdp_url: Option<String>,
     user_data_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
@@ -34,6 +37,7 @@ pub async fn run(
     let config = SessionConfig {
         chrome_path,
         resource_policy,
+        stealth_profile,
         persistent: session_id.is_some(),
         cdp_url,
         user_data_dir,
