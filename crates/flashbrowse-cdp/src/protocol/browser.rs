@@ -75,3 +75,22 @@ pub async fn resolve_websocket_url(endpoint: &str) -> Result<String, CdpError> {
             detail: "response has no browser WebSocket URL".into(),
         })
 }
+
+/// Configure browser-context downloads and enable Browser download events.
+pub async fn set_download_behavior(
+    client: &CdpClient,
+    download_path: &str,
+) -> Result<(), CdpError> {
+    let _: serde_json::Value = client
+        .send(
+            None,
+            "Browser.setDownloadBehavior",
+            serde_json::json!({
+                "behavior": "allow",
+                "downloadPath": download_path,
+                "eventsEnabled": true,
+            }),
+        )
+        .await?;
+    Ok(())
+}

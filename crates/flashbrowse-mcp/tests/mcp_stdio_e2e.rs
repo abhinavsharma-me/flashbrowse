@@ -81,7 +81,7 @@ async fn test_mcp_stdio_e2e() {
         .and_then(|r| r.get("tools"))
         .and_then(|t| t.as_array())
         .expect("tools list");
-    assert_eq!(tools.len(), 7);
+    assert_eq!(tools.len(), 9);
     let names: Vec<String> = tools
         .iter()
         .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(str::to_string))
@@ -94,6 +94,8 @@ async fn test_mcp_stdio_e2e() {
         "browser_screenshot",
         "browser_tabs",
         "browser_storage_state",
+        "browser_upload",
+        "browser_downloads",
     ] {
         assert!(names.contains(&want.to_string()), "missing tool {want}");
     }
@@ -449,12 +451,20 @@ async fn test_mcp_storage_state_import_export() {
             };
             tokio::spawn(async move {
                 let mut buf = [0u8; 2048];
-                let _ = sock.read(&mut buf).await;
-                let body = "<html><body><h1>Storage State</h1></body></html>";
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(), body
-                );
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/");
+                let response = if path == "/download" {
+                    let body = "download contents";
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Disposition: attachment; filename=download.txt\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                } else {
+                    let body = "<html><body><h1>Storage State</h1><label>Upload<input id='upload' type='file' aria-label='Upload a file'></label><a id='download' href='/download'>Download file</a></body></html>";
+                    format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body)
+                };
                 let _ = sock.write_all(response.as_bytes()).await;
             });
         }
@@ -465,12 +475,14 @@ async fn test_mcp_storage_state_import_export() {
     });
     std::fs::write(root.join("state.json"), serde_json::to_vec(&state).unwrap())
         .expect("write fixture state");
+    std::fs::write(root.join("upload.txt"), "upload contents").expect("write upload fixture");
 
     let (server_in, mut client_out) = duplex(64 * 1024);
     let (server_out, client_in) = duplex(64 * 1024);
     let mut client_lines = BufReader::new(client_in);
     let config = SessionConfig {
         storage_state_root: Some(root.clone()),
+        mcp_file_root: Some(root.clone()),
         ..Default::default()
     };
     let server = tokio::spawn(async move {
@@ -533,6 +545,69 @@ async fn test_mcp_storage_state_import_export() {
             .is_some_and(|items| items
                 .iter()
                 .any(|item| item["name"] == "token" && item["value"] == "storage-value")))));
+
+    let upload = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"browser_upload","arguments":{"action_id":1,"files":["upload.txt"]}}}),
+    ).await;
+    assert_tool_ok(&upload);
+    let uploaded_name = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"browser_evaluate","arguments":{"expression":"document.querySelector('#upload').files[0]?.name"}}}),
+    ).await;
+    assert!(
+        tool_text(&uploaded_name).contains("upload.txt"),
+        "file input did not receive the selected file: {uploaded_name}"
+    );
+
+    let start_download = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":8,"method":"tools/call","params":{"name":"browser_evaluate","arguments":{"expression":"document.querySelector('#download').click()"}}}),
+    ).await;
+    assert_tool_ok(&start_download);
+    let mut download_list = Value::Null;
+    for _ in 0..40 {
+        let response = roundtrip(
+            &mut client_out,
+            &mut client_lines,
+            serde_json::json!({"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"browser_downloads","arguments":{"action":"list"}}}),
+        ).await;
+        download_list = serde_json::from_str(&tool_text(&response)).unwrap_or(Value::Null);
+        if download_list["downloads"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(
+        download_list["downloads"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()),
+        "download event was not recorded: {download_list}"
+    );
+    let guid = download_list["downloads"][0]["guid"]
+        .as_str()
+        .expect("download guid");
+    let completed = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"browser_downloads","arguments":{"action":"wait","guid":guid,"timeout_ms":5000}}}),
+    ).await;
+    let completed: Value =
+        serde_json::from_str(&tool_text(&completed)).expect("download status JSON");
+    assert_eq!(
+        completed["state"], "completed",
+        "download did not complete: {completed}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("downloads/download.txt")).unwrap(),
+        "download contents"
+    );
 
     drop(client_out);
     drop(client_lines);

@@ -45,6 +45,13 @@ pub struct ResolveNodeParams {
     pub backend_node_id: i64,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetFileInputFilesParams {
+    pub files: Vec<String>,
+    pub backend_node_id: i64,
+}
+
 /// Response of `DOM.resolveNode`.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -141,4 +148,24 @@ pub async fn resolve_node(
             &ResolveNodeParams { backend_node_id },
         )
         .await
+}
+
+/// Set files on a file input without opening the native chooser.
+pub async fn set_file_input_files(
+    client: &CdpClient,
+    session_id: &str,
+    backend_node_id: i64,
+    files: Vec<String>,
+) -> Result<(), CdpError> {
+    let _: serde_json::Value = client
+        .send_typed(
+            Some(session_id),
+            "DOM.setFileInputFiles",
+            &SetFileInputFilesParams {
+                files,
+                backend_node_id,
+            },
+        )
+        .await?;
+    Ok(())
 }

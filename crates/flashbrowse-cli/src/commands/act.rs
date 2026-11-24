@@ -64,9 +64,15 @@ pub async fn run(
                 let v = value.ok_or_else(|| anyhow::anyhow!("select requires --value <option>"))?;
                 session.select(action_id, &v).await?
             }
+            "upload" => {
+                let path = value.ok_or_else(|| anyhow::anyhow!("upload requires --value <file-path>"))?;
+                session
+                    .upload_files(action_id, &[std::path::PathBuf::from(path)])
+                    .await?
+            }
             other => {
                 anyhow::bail!(
-                    "unknown action '{other}' (expected click|fill|hover|press_key|scroll|select)"
+                    "unknown action '{other}' (expected click|fill|hover|press_key|scroll|select|upload)"
                 );
             }
         };

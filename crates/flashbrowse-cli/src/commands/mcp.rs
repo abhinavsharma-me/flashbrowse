@@ -11,6 +11,7 @@ pub async fn run(
     cdp_url: Option<String>,
     user_data_dir: Option<PathBuf>,
     storage_state_root: Option<PathBuf>,
+    mcp_file_root: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let config = SessionConfig {
         chrome_path,
@@ -18,6 +19,7 @@ pub async fn run(
         cdp_url,
         user_data_dir,
         storage_state_root,
+        mcp_file_root,
         ..Default::default()
     };
     flashbrowse_mcp::serve_stdio(config)

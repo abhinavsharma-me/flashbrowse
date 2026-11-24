@@ -64,6 +64,8 @@ pub struct SessionConfig {
     pub cdp_url: Option<String>,
     /// Root directory allowed for MCP storage-state files.
     pub storage_state_root: Option<PathBuf>,
+    /// Root for MCP upload inputs and browser downloads.
+    pub mcp_file_root: Option<PathBuf>,
 }
 
 /// Native JavaScript dialog handling policy.
@@ -85,11 +87,102 @@ pub struct DialogInfo {
     pub accepted: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DownloadInfo {
+    pub guid: String,
+    pub url: String,
+    pub suggested_filename: String,
+    pub received_bytes: f64,
+    pub total_bytes: f64,
+    pub state: String,
+}
+
 #[derive(Debug, Default)]
 struct DialogState {
     policy: DialogPolicy,
     override_decision: Option<(bool, Option<String>)>,
     last_dialog: Option<DialogInfo>,
+}
+
+type DownloadTracker = Arc<std::sync::Mutex<HashMap<String, DownloadInfo>>>;
+
+fn download_directory(config: &SessionConfig) -> PathBuf {
+    config
+        .mcp_file_root
+        .clone()
+        .unwrap_or_else(|| crate::paths::cache_dir().join("files"))
+        .join("downloads")
+}
+
+fn install_download_tracker(client: &Arc<CdpClient>) -> DownloadTracker {
+    let downloads: DownloadTracker = Arc::default();
+    let mut begun = client.events().subscribe("Browser.downloadWillBegin");
+    let mut progress = client.events().subscribe("Browser.downloadProgress");
+    let begin_state = downloads.clone();
+    let progress_state = downloads.clone();
+    tokio::spawn(async move {
+        loop {
+            let event = match begun.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            let Some(guid) = event.get("guid").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Ok(mut downloads) = begin_state.lock() {
+                downloads.insert(
+                    guid.to_string(),
+                    DownloadInfo {
+                        guid: guid.to_string(),
+                        url: event
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        suggested_filename: event
+                            .get("suggestedFilename")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        received_bytes: 0.0,
+                        total_bytes: 0.0,
+                        state: "inProgress".to_string(),
+                    },
+                );
+            }
+        }
+    });
+    tokio::spawn(async move {
+        loop {
+            let event = match progress.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            let Some(guid) = event.get("guid").and_then(Value::as_str) else {
+                continue;
+            };
+            if let Ok(mut downloads) = progress_state.lock() {
+                if let Some(info) = downloads.get_mut(guid) {
+                    info.received_bytes = event
+                        .get("receivedBytes")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(info.received_bytes);
+                    info.total_bytes = event
+                        .get("totalBytes")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(info.total_bytes);
+                    info.state = event
+                        .get("state")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&info.state)
+                        .to_string();
+                }
+            }
+        }
+    });
+    downloads
 }
 
 impl SessionConfig {
@@ -341,6 +434,8 @@ pub struct BrowserSession {
     /// Timing breakdown of the most recent `open` (Phase 0 instrumentation).
     last_settle: Option<crate::observability::SettleBreakdown>,
     dialog_state: Arc<std::sync::Mutex<DialogState>>,
+    downloads: DownloadTracker,
+    download_dir: PathBuf,
 }
 
 /// Legacy settle result kept while the candidate is measured in shadow mode.
@@ -389,6 +484,17 @@ impl BrowserSession {
         );
         page_r?;
         net_r?;
+        let download_dir = download_directory(&config);
+        std::fs::create_dir_all(&download_dir).map_err(|error| {
+            CoreError::NavigationFailed(format!("cannot create download directory: {error}"))
+        })?;
+        let downloads = install_download_tracker(&client);
+        flashbrowse_cdp::protocol::browser::set_download_behavior(
+            &client,
+            &download_dir.to_string_lossy(),
+        )
+        .await?;
+        page::set_download_behavior(&client, &session_id, &download_dir.to_string_lossy()).await?;
         let _: Value = acc_r.unwrap_or(serde_json::json!({}));
 
         let (_, _) = tokio::join!(
@@ -425,6 +531,8 @@ impl BrowserSession {
             last_tree: String::new(),
             last_settle: None,
             dialog_state,
+            downloads,
+            download_dir,
         })
     }
 
@@ -468,6 +576,17 @@ impl BrowserSession {
         );
         p_r?;
         n_r?;
+        let download_dir = download_directory(config);
+        std::fs::create_dir_all(&download_dir).map_err(|error| {
+            CoreError::NavigationFailed(format!("cannot create download directory: {error}"))
+        })?;
+        let downloads = install_download_tracker(&client);
+        flashbrowse_cdp::protocol::browser::set_download_behavior(
+            &client,
+            &download_dir.to_string_lossy(),
+        )
+        .await?;
+        page::set_download_behavior(&client, &session_id, &download_dir.to_string_lossy()).await?;
         let _: Value = a_r.unwrap_or(serde_json::json!({}));
 
         // Per-session settings: always re-apply (parallel).
@@ -506,6 +625,8 @@ impl BrowserSession {
             last_tree: String::new(),
             last_settle: None,
             dialog_state,
+            downloads,
+            download_dir,
         };
         // Wait for the popup document to finish loading and remain quiet long
         // enough for post-load hydration before creating its first action map.
@@ -1272,6 +1393,80 @@ impl BrowserSession {
             self.url.clone()
         };
         self.open(&current_url).await
+    }
+
+    /// Populate an `<input type=file>` with existing files and rebuild its tree.
+    pub async fn upload_files(
+        &mut self,
+        action_id: u32,
+        files: &[PathBuf],
+    ) -> Result<String, CoreError> {
+        if files.is_empty() {
+            return Err(CoreError::NavigationFailed(
+                "upload requires at least one file".into(),
+            ));
+        }
+        let backend = *self
+            .action_map
+            .get(&action_id)
+            .ok_or(CoreError::ActionNotFound(action_id))?;
+        let (dom_sid, _) = self.frame_for_action(action_id);
+        let object = dom::resolve_node(&self.client, &dom_sid, backend).await?;
+        let object_id = object
+            .object
+            .object_id
+            .ok_or(CoreError::NoBackendId(action_id))?;
+        let input_check = runtime::call_function_on(
+            &self.client,
+            &dom_sid,
+            &object_id,
+            "function() { return this instanceof HTMLInputElement && this.type === 'file'; }",
+            Vec::new(),
+        )
+        .await?;
+        if !input_check
+            .result
+            .value
+            .as_ref()
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(CoreError::NavigationFailed(format!(
+                "action [{action_id}] is not a file input"
+            )));
+        }
+        let mut canonical_files = Vec::with_capacity(files.len());
+        for file in files {
+            let canonical = std::fs::canonicalize(file).map_err(|error| {
+                CoreError::NavigationFailed(format!(
+                    "cannot access upload file {}: {error}",
+                    file.display()
+                ))
+            })?;
+            if !canonical.is_file() {
+                return Err(CoreError::NavigationFailed(format!(
+                    "upload path is not a file: {}",
+                    canonical.display()
+                )));
+            }
+            canonical_files.push(canonical.to_string_lossy().into_owned());
+        }
+        dom::set_file_input_files(&self.client, &dom_sid, backend, canonical_files).await?;
+        self.rebuild_tree().await
+    }
+
+    pub fn downloads(&self) -> Vec<DownloadInfo> {
+        let mut result = self
+            .downloads
+            .lock()
+            .map(|downloads| downloads.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        result.sort_by(|left, right| left.guid.cmp(&right.guid));
+        result
+    }
+
+    pub fn download_dir(&self) -> &std::path::Path {
+        &self.download_dir
     }
 
     pub async fn list_tabs(&self) -> Result<Vec<target::TargetInfo>, CoreError> {

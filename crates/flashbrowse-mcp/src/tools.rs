@@ -105,6 +105,30 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["action", "name"]
             }
         }),
+        serde_json::json!({
+            "name": "browser_upload",
+            "description": "Uploads one or more files to a file input. Paths are resolved inside the configured MCP file root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action_id": {"type": "integer", "description": "Action ID of an input[type=file]"},
+                    "files": {"type": "array", "items": {"type": "string"}, "description": "File names or relative paths under the configured MCP file root"}
+                },
+                "required": ["action_id", "files"]
+            }
+        }),
+        serde_json::json!({
+            "name": "browser_downloads",
+            "description": "Lists download progress or waits for one download to complete or fail. Downloads are saved under the configured MCP file root's downloads directory.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["list", "wait"], "default": "list"},
+                    "guid": {"type": "string", "description": "Download identifier returned by the list action"},
+                    "timeout_ms": {"type": "integer", "default": 10000, "description": "Maximum wait, capped at 20000 ms"}
+                }
+            }
+        }),
     ]
 }
 
@@ -208,6 +232,8 @@ pub async fn call_tool(
         "browser_screenshot" => call_screenshot(arguments, handle).await,
         "browser_tabs" => call_tabs(arguments, handle, default_config).await,
         "browser_storage_state" => call_storage_state(arguments, handle, default_config).await,
+        "browser_upload" => call_upload(arguments, handle, default_config).await,
+        "browser_downloads" => call_downloads(arguments, handle).await,
         other => Err(McpError::InvalidParams(format!("unknown tool '{other}'"))),
     };
     // `open` is the only tool that owns a settle; read it back from the
@@ -465,6 +491,50 @@ fn storage_state_path(config: &SessionConfig, name: &str) -> Result<std::path::P
     Ok(path)
 }
 
+fn mcp_file_root(config: &SessionConfig) -> Result<std::path::PathBuf, McpError> {
+    let root = config
+        .mcp_file_root
+        .clone()
+        .unwrap_or_else(|| flashbrowse_core::paths::cache_dir().join("files"));
+    std::fs::create_dir_all(&root).map_err(|error| McpError::Internal(error.to_string()))?;
+    std::fs::canonicalize(root).map_err(|error| McpError::Internal(error.to_string()))
+}
+
+fn resolve_upload_files(
+    config: &SessionConfig,
+    values: &[Value],
+) -> Result<Vec<std::path::PathBuf>, McpError> {
+    if values.is_empty() || values.len() > 20 {
+        return Err(McpError::InvalidParams(
+            "files must contain between 1 and 20 file paths".into(),
+        ));
+    }
+    let root = mcp_file_root(config)?;
+    values
+        .iter()
+        .map(|value| {
+            let raw = value.as_str().ok_or_else(|| {
+                McpError::InvalidParams("each files item must be a path string".into())
+            })?;
+            let candidate = std::path::Path::new(raw);
+            let candidate = if candidate.is_absolute() {
+                candidate.to_path_buf()
+            } else {
+                root.join(candidate)
+            };
+            let canonical = std::fs::canonicalize(candidate).map_err(|error| {
+                McpError::InvalidParams(format!("cannot access upload file: {error}"))
+            })?;
+            if !canonical.starts_with(&root) || !canonical.is_file() {
+                return Err(McpError::InvalidParams(
+                    "upload files must be regular files within the configured MCP file root".into(),
+                ));
+            }
+            Ok(canonical)
+        })
+        .collect()
+}
+
 async fn call_storage_state(
     arguments: &Value,
     handle: &SessionHandle,
@@ -507,6 +577,71 @@ async fn call_storage_state(
             "action must be import or export".into(),
         )),
     }
+}
+
+async fn call_upload(
+    arguments: &Value,
+    handle: &SessionHandle,
+    config: &SessionConfig,
+) -> Result<ToolResult, McpError> {
+    let action_id = arg_u32(arguments, "action_id")?;
+    let values = arguments
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| McpError::InvalidParams("files must be an array of paths".into()))?;
+    let files = resolve_upload_files(config, values)?;
+    let mut guard = handle.lock().await;
+    let session = require_session(&mut guard)?;
+    session
+        .upload_files(action_id, &files)
+        .await
+        .map(ToolResult::text)
+        .map_err(|error| McpError::InvalidParams(error.to_string()))
+}
+
+async fn call_downloads(arguments: &Value, handle: &SessionHandle) -> Result<ToolResult, McpError> {
+    let action = arg_opt_string(arguments, "action").unwrap_or_else(|| "list".into());
+    let mut guard = handle.lock().await;
+    let session = require_session(&mut guard)?;
+    if action == "wait" {
+        let guid = arg_string(arguments, "guid")?;
+        let timeout_ms = arguments
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(10_000)
+            .clamp(100, 20_000);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            if let Some(download) = session
+                .downloads()
+                .into_iter()
+                .find(|item| item.guid == guid)
+            {
+                if download.state != "inProgress" || tokio::time::Instant::now() >= deadline {
+                    return Ok(ToolResult::text(
+                        serde_json::to_string(&download).unwrap_or_default(),
+                    ));
+                }
+            } else if tokio::time::Instant::now() >= deadline {
+                return Err(McpError::InvalidParams(format!(
+                    "unknown download guid: {guid}"
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    if action != "list" {
+        return Err(McpError::InvalidParams(
+            "action must be list or wait".into(),
+        ));
+    }
+    let result = serde_json::json!({
+        "download_dir": session.download_dir(),
+        "downloads": session.downloads(),
+    });
+    Ok(ToolResult::text(
+        serde_json::to_string(&result).unwrap_or_default(),
+    ))
 }
 
 async fn call_act(
@@ -752,5 +887,20 @@ mod tests {
         assert!(storage_state_path(&config, "../outside").is_err());
         assert!(storage_state_path(&config, "nested/name").is_err());
         assert!(storage_state_path(&config, "valid-state").is_ok());
+    }
+
+    #[test]
+    fn upload_paths_are_confined_to_the_configured_root() {
+        let root =
+            std::env::temp_dir().join(format!("flashbrowse-upload-root-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("inside.txt"), "x").unwrap();
+        let config = SessionConfig {
+            mcp_file_root: Some(root.clone()),
+            ..Default::default()
+        };
+        assert!(resolve_upload_files(&config, &[Value::String("inside.txt".into())]).is_ok());
+        assert!(resolve_upload_files(&config, &[Value::String("../outside.txt".into())]).is_err());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

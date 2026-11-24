@@ -104,6 +104,26 @@ pub async fn enable(client: &CdpClient, session_id: &str) -> Result<(), CdpError
     Ok(())
 }
 
+/// Set this page's download destination and enable progress notifications.
+pub async fn set_download_behavior(
+    client: &CdpClient,
+    session_id: &str,
+    download_path: &str,
+) -> Result<(), CdpError> {
+    let _: serde_json::Value = client
+        .send(
+            Some(session_id),
+            "Page.setDownloadBehavior",
+            serde_json::json!({
+                "behavior": "allow",
+                "downloadPath": download_path,
+                "eventsEnabled": true,
+            }),
+        )
+        .await?;
+    Ok(())
+}
+
 /// Frame metadata in `Page.getFrameTree`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]

@@ -99,6 +99,30 @@ Global flags: `--chrome-path <p>`, `--text-only`, `--full-render`,
 `--resource-policy agent-default|text-only|full-render`, `--verbose`,
 `--log-format text|json`.
 
+### Existing browser profiles and file transfer
+
+`flashbrowse open <url> --user-data-dir <directory>` launches Chrome with the
+selected profile. Use `--cdp-url <http://host:port>` or a browser `ws://`
+endpoint to attach to an existing Chrome process. Attached browsers remain
+running when Flashbrowse disconnects. The two options cannot be combined.
+The MCP server accepts the same flags:
+
+```text
+flashbrowse mcp --cdp-url http://127.0.0.1:9222 --file-root ./browser-files
+flashbrowse mcp --storage-state-root ./states
+flashbrowse act 4 --session-id s1 --action upload --value ./report.pdf
+```
+
+MCP `browser_storage_state` imports or exports cookies and per-origin
+localStorage using named JSON files under `--storage-state-root` (default
+`~/.cache/flashbrowse/storage-state`). MCP `browser_upload` accepts paths only
+within `--file-root` (default `~/.cache/flashbrowse/files`). Downloads are
+saved under that root's `downloads` directory. `browser_downloads` reports
+download progress and can wait for completion or cancellation. Native
+JavaScript alerts are accepted by default; confirms and prompts are dismissed.
+Pass `dialog_action` to `browser_act` to override the next dialog, and include
+`prompt_text` only when accepting a prompt.
+
 The scheme is optional, like an address bar: `flashbrowse open example.com`
 uses `https://`, while local hosts (`localhost:3000`, `127.0.0.1`, `::1`,
 `*.local`, RFC1918 addresses) use `http://` because a dev server is plain HTTP

@@ -78,6 +78,9 @@ enum Commands {
         /// Confine MCP browser storage-state files to this directory.
         #[arg(long)]
         storage_state_root: Option<PathBuf>,
+        /// Confine MCP uploads and downloads to this directory.
+        #[arg(long)]
+        file_root: Option<PathBuf>,
     },
     /// Open a URL and display the token-compressed action tree.
     Open {
@@ -104,7 +107,7 @@ enum Commands {
         /// Action to perform.
         #[arg(long, default_value = "click")]
         action: String,
-        /// Text payload for `fill`, key for `press_key`, direction for `scroll`.
+        /// Text payload for `fill`, key for `press_key`, direction for `scroll`, or file path for `upload`.
         #[arg(long)]
         value: Option<String>,
     },
@@ -241,6 +244,7 @@ async fn main() -> anyhow::Result<()> {
                 cdp_url,
                 user_data_dir,
                 storage_state_root,
+                file_root,
             } => {
                 commands::mcp::run(
                     cli.chrome_path,
@@ -248,6 +252,7 @@ async fn main() -> anyhow::Result<()> {
                     cdp_url,
                     user_data_dir,
                     storage_state_root,
+                    file_root,
                 )
                 .await
             }
