@@ -46,7 +46,9 @@ pub fn tool_definitions() -> Vec<Value> {
                     "action_id": {"type": "integer", "description": "Element ID number from the action tree"},
                     "action": {"type": "string", "enum": ["click", "fill", "hover", "press_key", "scroll", "select"], "description": "Interaction to perform"},
                     "value": {"type": "string", "description": "Text payload for 'fill', key name for 'press_key', direction for 'scroll', or option label for 'select'"},
-                    "amount": {"type": "number", "description": "Pixel distance for 'scroll' (default 300)"}
+                    "amount": {"type": "number", "description": "Pixel distance for 'scroll' (default 300)"},
+                    "dialog_action": {"type": "string", "enum": ["accept", "dismiss"], "description": "Optional disposition for a native JavaScript dialog opened by this action"},
+                    "prompt_text": {"type": "string", "description": "Text supplied only when dialog_action is accept and a prompt opens"}
                 },
                 "required": ["action_id", "action"]
             }
@@ -447,34 +449,49 @@ async fn call_act(
         .map(|t| t.target_id)
         .collect();
 
+    if action == "fill" && arguments.get("value").is_none() {
+        return Ok(ToolResult::error(
+            "fill requires 'value' (text payload, may be empty to clear)".to_string(),
+        ));
+    }
+    if action == "press_key" && value.is_empty() {
+        return Ok(ToolResult::error(
+            "press_key requires 'value' (key name, e.g. Enter, ArrowDown, a)".to_string(),
+        ));
+    }
+    if action == "select" && arguments.get("value").is_none() {
+        return Ok(ToolResult::error(
+            "select requires 'value' (option text or value)".to_string(),
+        ));
+    }
+    let prompt_text = arg_opt_string(arguments, "prompt_text");
+    if let Some(dialog_action) = arg_opt_string(arguments, "dialog_action") {
+        match dialog_action.as_str() {
+            "accept" => session.set_dialog_override(true, prompt_text),
+            "dismiss" if prompt_text.is_none() => session.set_dialog_override(false, None),
+            "dismiss" => {
+                return Ok(ToolResult::error(
+                    "prompt_text requires dialog_action=accept".into(),
+                ))
+            }
+            _ => {
+                return Ok(ToolResult::error(
+                    "dialog_action must be accept or dismiss".into(),
+                ))
+            }
+        }
+    } else if prompt_text.is_some() {
+        return Ok(ToolResult::error(
+            "prompt_text requires dialog_action=accept".into(),
+        ));
+    }
+
     let result = match action.as_str() {
         "click" => session.click(action_id).await,
-        "fill" => {
-            // Allow explicit empty string (clear-field); reject missing key.
-            if arguments.get("value").is_none() {
-                return Ok(ToolResult::error(
-                    "fill requires 'value' (text payload, may be empty to clear)".to_string(),
-                ));
-            }
-            session.fill(action_id, &value).await
-        }
+        "fill" => session.fill(action_id, &value).await,
         "hover" => session.hover(action_id).await,
-        "press_key" => {
-            if value.is_empty() {
-                return Ok(ToolResult::error(
-                    "press_key requires 'value' (key name, e.g. Enter, ArrowDown, a)".to_string(),
-                ));
-            }
-            session.press_key(&value).await
-        }
-        "select" => {
-            if arguments.get("value").is_none() {
-                return Ok(ToolResult::error(
-                    "select requires 'value' (option text or value)".to_string(),
-                ));
-            }
-            session.select(action_id, &value).await
-        }
+        "press_key" => session.press_key(&value).await,
+        "select" => session.select(action_id, &value).await,
         "scroll" => {
             let direction = if value.is_empty() {
                 ScrollDirection::Down
@@ -500,8 +517,24 @@ async fn call_act(
             )))
         }
     };
+    session.clear_dialog_override();
+    let dialog = session.take_dialog_info();
     match result {
         Ok(tree) => {
+            let tree = if let Some(dialog) = dialog {
+                format!(
+                    "{tree}\n\n[handled JavaScript {} dialog: {} ({})]",
+                    dialog.dialog_type,
+                    if dialog.accepted {
+                        "accepted"
+                    } else {
+                        "dismissed"
+                    },
+                    dialog.message
+                )
+            } else {
+                tree
+            };
             let mut config = default_config.clone();
             config.resource_policy = session.resource_policy();
             match focus_new_popup(session, &opener, &existing, &config).await {

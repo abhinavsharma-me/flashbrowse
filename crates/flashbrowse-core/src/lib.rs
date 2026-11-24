@@ -22,8 +22,8 @@ pub mod url_norm;
 pub use engine::BrowserEngine;
 pub use resource_policy::ResourcePolicy;
 pub use session::{
-    BrowserSession, CoreError, DetachedSession, ScreenshotOptions, SessionConfig,
-    SCREENSHOT_PREPARE_MS_DEFAULT, SCREENSHOT_PREPARE_MS_MAX,
+    BrowserSession, CoreError, DetachedSession, DialogInfo, DialogPolicy, ScreenshotOptions,
+    SessionConfig, SCREENSHOT_PREPARE_MS_DEFAULT, SCREENSHOT_PREPARE_MS_MAX,
 };
 pub use tree::{
     compress_with_options, render, render_nested, ActionMap, CompressOptions, SemanticNode,

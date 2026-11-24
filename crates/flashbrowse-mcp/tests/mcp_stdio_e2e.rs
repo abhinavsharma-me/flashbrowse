@@ -224,11 +224,57 @@ async fn test_mcp_stdio_e2e() {
     ).await;
     assert_tool_ok(&resp);
 
+    let dialog_page = "data:text/html,<html><body><h1>Dialog Test</h1><button onclick=\"alert('alert-note')\">Alert</button><button onclick=\"document.getElementById('result').textContent=confirm('confirm-note')?'yes':'no'\">Confirm</button><button onclick=\"document.getElementById('result').textContent=prompt('prompt-note')\">Prompt</button><p id='result'></p></body></html>";
+    let resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":dialog_page}}}),
+    ).await;
+    assert!(tool_text(&resp).contains("Dialog Test"), "{resp}");
+
+    let resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"browser_act","arguments":{"action_id":1,"action":"click"}}}),
+    ).await;
+    assert!(
+        tool_text(&resp).contains("alert dialog: accepted (alert-note)"),
+        "alert hung or was not accepted: {resp}"
+    );
+
+    let resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"browser_act","arguments":{"action_id":2,"action":"click"}}}),
+    ).await;
+    assert!(
+        tool_text(&resp).contains("confirm dialog: dismissed (confirm-note)"),
+        "confirm did not use safe default: {resp}"
+    );
+    assert!(
+        tool_text(&resp).contains("no"),
+        "confirm result did not reflect dismissal: {resp}"
+    );
+
+    let resp = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"browser_act","arguments":{"action_id":3,"action":"click","dialog_action":"accept","prompt_text":"provided-value"}}}),
+    ).await;
+    assert!(
+        tool_text(&resp).contains("prompt dialog: accepted (prompt-note)"),
+        "prompt did not use explicit acceptance: {resp}"
+    );
+    assert!(
+        tool_text(&resp).contains("provided-value"),
+        "prompt text was not delivered: {resp}"
+    );
+
     // ping → result
     let resp = roundtrip(
         &mut client_out,
         &mut client_lines,
-        serde_json::json!({"jsonrpc": "2.0", "id": 15, "method": "ping", "params": {}}),
+        serde_json::json!({"jsonrpc": "2.0", "id": 19, "method": "ping", "params": {}}),
     )
     .await;
     assert!(resp.get("error").is_none());

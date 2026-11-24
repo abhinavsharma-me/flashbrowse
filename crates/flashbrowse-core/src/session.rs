@@ -56,6 +56,34 @@ pub struct SessionConfig {
     pub extra_args: Vec<String>,
     /// Keep Chromium alive after parent CLI exit (`open --session-id`).
     pub persistent: bool,
+    /// Default disposition for native JavaScript dialogs.
+    pub dialog_policy: DialogPolicy,
+}
+
+/// Native JavaScript dialog handling policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum DialogPolicy {
+    /// Accept alerts; dismiss confirms and prompts to avoid blocking the page.
+    #[default]
+    SafeDefault,
+    /// Accept all dialog types (prompts receive no text).
+    AcceptAll,
+    /// Dismiss all dialog types.
+    DismissAll,
+}
+
+#[derive(Debug, Clone)]
+pub struct DialogInfo {
+    pub dialog_type: String,
+    pub message: String,
+    pub accepted: bool,
+}
+
+#[derive(Debug, Default)]
+struct DialogState {
+    policy: DialogPolicy,
+    override_decision: Option<(bool, Option<String>)>,
+    last_dialog: Option<DialogInfo>,
 }
 
 impl SessionConfig {
@@ -73,6 +101,80 @@ impl SessionConfig {
 
 fn settle_shadow_enabled() -> bool {
     std::env::var("FLASHBROWSE_SETTLE_SHADOW").is_ok_and(|value| value == "1")
+}
+
+fn install_dialog_handler(
+    client: &Arc<CdpClient>,
+    session_id: &str,
+    policy: DialogPolicy,
+) -> Arc<std::sync::Mutex<DialogState>> {
+    let state = Arc::new(std::sync::Mutex::new(DialogState {
+        policy,
+        ..DialogState::default()
+    }));
+    let mut events = client.events().subscribe("Page.javascriptDialogOpening");
+    let state_for_task = state.clone();
+    let client = client.clone();
+    let session_id = session_id.to_string();
+    tokio::spawn(async move {
+        loop {
+            let event = match events.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                    tracing::warn!(count, "missed JavaScript dialog events");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            let dialog_type = event
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("alert")
+                .to_string();
+            let message = event
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let (accepted, prompt_text) = {
+                let Ok(mut state) = state_for_task.lock() else {
+                    continue;
+                };
+                let (accepted, prompt_text) = match state.override_decision.take() {
+                    Some(decision) => decision,
+                    None => match state.policy {
+                        DialogPolicy::SafeDefault => (dialog_type == "alert", None),
+                        DialogPolicy::AcceptAll => (true, None),
+                        DialogPolicy::DismissAll => (false, None),
+                    },
+                };
+                (accepted, prompt_text)
+            };
+            let response: Result<Value, CdpError> = client
+                .send(
+                    Some(&session_id),
+                    "Page.handleJavaScriptDialog",
+                    serde_json::json!({
+                        "accept": accepted,
+                        "promptText": prompt_text,
+                    }),
+                )
+                .await;
+            match response {
+                Ok(_) => {
+                    if let Ok(mut state) = state_for_task.lock() {
+                        state.last_dialog = Some(DialogInfo {
+                            dialog_type,
+                            message,
+                            accepted,
+                        });
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "failed to resolve JavaScript dialog"),
+            }
+        }
+    });
+    state
 }
 
 /// Options for [`BrowserSession::screenshot`].
@@ -230,6 +332,7 @@ pub struct BrowserSession {
     last_tree: String,
     /// Timing breakdown of the most recent `open` (Phase 0 instrumentation).
     last_settle: Option<crate::observability::SettleBreakdown>,
+    dialog_state: Arc<std::sync::Mutex<DialogState>>,
 }
 
 /// Legacy settle result kept while the candidate is measured in shadow mode.
@@ -258,6 +361,7 @@ impl BrowserSession {
         let t = target::create_target(&client, "about:blank").await?;
         let s = target::attach_to_target(&client, &t.target_id).await?;
         let session_id = s.session_id.clone();
+        let dialog_state = install_dialog_handler(&client, &session_id, config.dialog_policy);
 
         // Domains must be enabled before navigate so events + AXTree work.
         // Parallelized (was 3 sequential round-trips).
@@ -307,6 +411,7 @@ impl BrowserSession {
             url: String::new(),
             last_tree: String::new(),
             last_settle: None,
+            dialog_state,
         })
     }
 
@@ -336,6 +441,7 @@ impl BrowserSession {
         };
         let s = target::attach_to_target(&client, &tid).await?;
         let session_id = s.session_id.clone();
+        let dialog_state = install_dialog_handler(&client, &session_id, config.dialog_policy);
 
         // Domains (parallel - 1 round-trip instead of 3).
         let (p_r, n_r, a_r) = tokio::join!(
@@ -386,6 +492,7 @@ impl BrowserSession {
             url: String::new(),
             last_tree: String::new(),
             last_settle: None,
+            dialog_state,
         };
         // Wait for the popup document to finish loading and remain quiet long
         // enough for post-load hydration before creating its first action map.
@@ -1060,6 +1167,28 @@ impl BrowserSession {
     /// CDP `Target` id backing this page.
     pub fn target_id(&self) -> &str {
         &self.target_id
+    }
+
+    /// Set a one-action override. It is consumed by the next dialog event.
+    pub fn set_dialog_override(&self, accept: bool, prompt_text: Option<String>) {
+        if let Ok(mut state) = self.dialog_state.lock() {
+            state.override_decision = Some((accept, prompt_text));
+            state.last_dialog = None;
+        }
+    }
+
+    pub fn clear_dialog_override(&self) {
+        if let Ok(mut state) = self.dialog_state.lock() {
+            state.override_decision = None;
+        }
+    }
+
+    /// Return and clear the most recently handled dialog, if any.
+    pub fn take_dialog_info(&self) -> Option<DialogInfo> {
+        self.dialog_state
+            .lock()
+            .ok()
+            .and_then(|mut state| state.last_dialog.take())
     }
 
     pub async fn list_tabs(&self) -> Result<Vec<target::TargetInfo>, CoreError> {
