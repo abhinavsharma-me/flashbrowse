@@ -599,3 +599,71 @@ async fn iframe_content_appears_in_action_tree_click_and_markdown() {
 
     session.shutdown().await;
 }
+
+#[tokio::test]
+async fn nested_tree_default_open_shadow_root_and_clickable_div() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        eprintln!("SKIP: no Chromium binary found");
+        return;
+    }
+    let mut session =
+        flashbrowse_core::BrowserSession::launch(flashbrowse_core::SessionConfig::default())
+            .await
+            .expect("launch Chrome");
+    let html = r#"<!doctype html>
+<html>
+<body>
+  <main>
+    <h1>Shadow Host</h1>
+    <div id="host"></div>
+    <div id="tap" onclick="this.textContent='Div Clicked'">Tap Div</div>
+  </main>
+  <script>
+    const host = document.getElementById('host');
+    const root = host.attachShadow({ mode: 'open' });
+    root.innerHTML = '<h2>Shadow Title</h2><p>Shadow body text</p><button onclick="this.textContent=\'Shadow Pressed\'">Shadow Action</button>';
+  </script>
+</body>
+</html>"#;
+    let url = format!("data:text/html,{}", html.replace('\n', ""));
+    let tree = session.open(&url).await.expect("open");
+    let body = tree.split("---\n").nth(1).unwrap_or(&tree);
+
+    assert!(
+        body.lines().any(|line| line.starts_with("  ")),
+        "expected nested indentation by default:\n{tree}"
+    );
+    assert!(
+        body.contains("Shadow Title")
+            && body.contains("Shadow body text")
+            && body.contains("Shadow Action"),
+        "open shadow root content missing from tree:\n{tree}"
+    );
+    assert_eq!(
+        body.matches("Tap Div").count(),
+        1,
+        "clickable div text should appear once:\n{tree}"
+    );
+
+    let tap_id = body
+        .lines()
+        .find(|line| line.contains("Tap Div"))
+        .and_then(|line| line.trim_start().strip_prefix('['))
+        .and_then(|rest| rest.split(']').next())
+        .and_then(|num| num.parse::<u32>().ok())
+        .expect("clickable div must have an action_id");
+
+    let after_tap = session.click(tap_id).await.expect("click non-ARIA div");
+    assert!(
+        after_tap.contains("Div Clicked"),
+        "clicking non-ARIA div did not run onclick handler:\n{after_tap}"
+    );
+
+    let md = session.extract_markdown().await.expect("extract markdown");
+    assert!(
+        md.contains("Shadow Title") && md.contains("Shadow body text"),
+        "extract_markdown omitted open shadow root content:\n{md}"
+    );
+
+    session.shutdown().await;
+}

@@ -96,13 +96,42 @@ pub const SETTLE_DIAGNOSTICS_SCRIPT: &str = r#"(() => {
     const observer = new MutationObserver((records) => {
       state.count += records.length;
       state.last_ms = performance.now();
+      for (const rec of records) {
+        for (const node of rec.addedNodes || []) {
+          if (node && node.nodeType === 1) observeTree(node);
+        }
+      }
     });
-    observer.observe(document, {
+    const observeOpts = {
       subtree: true,
       childList: true,
       characterData: true,
       attributes: true
-    });
+    };
+    const observed = new WeakSet();
+    const observeRoot = (root) => {
+      if (!root || observed.has(root)) return;
+      observed.add(root);
+      observer.observe(root, observeOpts);
+      for (const el of root.querySelectorAll('*')) {
+        if (el.shadowRoot) observeRoot(el.shadowRoot);
+      }
+    };
+    const observeTree = (el) => {
+      if (el.shadowRoot) observeRoot(el.shadowRoot);
+      if (el.querySelectorAll) {
+        for (const child of el.querySelectorAll('*')) {
+          if (child.shadowRoot) observeRoot(child.shadowRoot);
+        }
+      }
+    };
+    const origAttachShadow = Element.prototype.attachShadow;
+    Element.prototype.attachShadow = function(init) {
+      const root = origAttachShadow.call(this, init);
+      if (init && init.mode === 'open') observeRoot(root);
+      return root;
+    };
+    observeRoot(document);
   } catch (_) {}
 })();
 "#;

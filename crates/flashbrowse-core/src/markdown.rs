@@ -15,20 +15,25 @@ pub const EXTRACT_SCRIPT: &str = r#"
   const lines = [];
   lines.push('# ' + (title || 'Untitled'));
   lines.push('');
-  const docs = [];
-  const collectDocs = (doc) => {
-    if (!doc) return;
-    docs.push(doc);
-    for (const f of doc.querySelectorAll('iframe, frame')) {
-      try {
-        if (f.contentDocument) collectDocs(f.contentDocument);
-      } catch (_) {}
+  const roots = [];
+  const collectRoots = (root) => {
+    if (!root) return;
+    roots.push(root);
+    for (const el of root.querySelectorAll('*')) {
+      if (el.shadowRoot) {
+        collectRoots(el.shadowRoot);
+      }
+      if (el.tagName === 'IFRAME' || el.tagName === 'FRAME') {
+        try {
+          if (el.contentDocument) collectRoots(el.contentDocument);
+        } catch (_) {}
+      }
     }
   };
-  collectDocs(document);
+  collectRoots(document);
   const seen = new Set();
-  for (const doc of docs) {
-  for (const el of doc.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,pre,blockquote')) {
+  for (const root of roots) {
+  for (const el of root.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,pre,blockquote')) {
     // Skip if any ancestor is also selected and closer to a deeper block -
     // actually querySelectorAll is flat; dedupe by text to kill <li><p> doubles.
     const tag = el.tagName.toLowerCase();

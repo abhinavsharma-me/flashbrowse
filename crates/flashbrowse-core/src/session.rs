@@ -18,7 +18,24 @@ use crate::interceptor::{blocked_patterns, blocked_patterns_for_screenshot};
 use crate::markdown::EXTRACT_SCRIPT;
 use crate::resource_policy::ResourcePolicy;
 use crate::stealth::{SETTLE_DIAGNOSTICS_SCRIPT, STEALTH_SCRIPT};
-use crate::tree::{compress, render, ActionMap};
+use crate::tree::{compress, render_nested, ActionMap};
+
+const SETTLE_DOM_STATS_JS: &str = r#"(() => {
+  let count = 0;
+  let textLen = document.body ? document.body.innerText.length : 0;
+  const walk = (root) => {
+    const els = root.querySelectorAll('*');
+    count += els.length;
+    for (const el of els) {
+      if (el.shadowRoot) {
+        textLen += (el.shadowRoot.textContent || '').length;
+        walk(el.shadowRoot);
+      }
+    }
+  };
+  walk(document);
+  return `${document.readyState}|${count}|${textLen}`;
+})()"#;
 
 /// Errors surfaced by the core engine (maps to MCP `tools/call` error).
 #[derive(Debug, thiserror::Error)]
@@ -734,7 +751,7 @@ impl BrowserSession {
         loop {
             let state = self
                 .driver
-                .evaluate("document.readyState + '|' + document.getElementsByTagName('*').length + '|' + (document.body ? document.body.innerText.length : 0)")
+                .evaluate(SETTLE_DOM_STATS_JS)
                 .await
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string));
@@ -1033,14 +1050,18 @@ impl BrowserSession {
             let t_poll = std::time::Instant::now();
             let needs_static_classification = raw_ax_nodes < 100 && !legacy_saw_change;
             let cheap_expression = if shadow_enabled {
-                "document.readyState + '|' + document.getElementsByTagName('*').length + '|' + (document.body ? document.body.innerText.length : 0) + '|' + (document.scripts.length === 0 && document.querySelectorAll('iframe').length === 0 && !document.querySelector('meta[http-equiv=refresh]')) + '|' + (window.__flashbrowseMutationState?.count ?? 0) + '|' + (window.__flashbrowseMutationState?.last_ms ?? 0) + '|' + (window.__flashbrowseMutationState ? performance.now() - window.__flashbrowseMutationState.last_ms : 0)"
+                format!(
+                    "{SETTLE_DOM_STATS_JS} + '|' + (document.scripts.length === 0 && document.querySelectorAll('iframe').length === 0 && !document.querySelector('meta[http-equiv=refresh]')) + '|' + (window.__flashbrowseMutationState?.count ?? 0) + '|' + (window.__flashbrowseMutationState?.last_ms ?? 0) + '|' + (window.__flashbrowseMutationState ? performance.now() - window.__flashbrowseMutationState.last_ms : 0)"
+                )
             } else if needs_static_classification {
-                "document.readyState + '|' + document.getElementsByTagName('*').length + '|' + (document.body ? document.body.innerText.length : 0) + '|' + (document.scripts.length === 0 && document.querySelectorAll('iframe').length === 0 && !document.querySelector('meta[http-equiv=refresh]'))"
+                format!(
+                    "{SETTLE_DOM_STATS_JS} + '|' + (document.scripts.length === 0 && document.querySelectorAll('iframe').length === 0 && !document.querySelector('meta[http-equiv=refresh]'))"
+                )
             } else {
-                "document.readyState + '|' + document.getElementsByTagName('*').length + '|' + (document.body ? document.body.innerText.length : 0) + '|false'"
+                format!("{SETTLE_DOM_STATS_JS} + '|false'")
             };
             if let Ok(cheap) =
-                runtime::evaluate(&self.client, &self.session_id, cheap_expression).await
+                runtime::evaluate(&self.client, &self.session_id, &cheap_expression).await
             {
                 if let Some(Value::String(s)) = cheap.result.value.as_ref() {
                     let mut it = s.split('|');
@@ -1296,13 +1317,13 @@ impl BrowserSession {
         self.refresh_title_url().await;
         title_url_ms += t_titles_final.elapsed().as_millis() as u64;
         let t_render = std::time::Instant::now();
-        let rendered = render(&self.title, &self.url, &nodes);
+        let rendered = render_nested(&self.title, &self.url, &nodes);
         let render_ms = t_render.elapsed().as_millis() as u64;
         let (legacy_tree_sha256, candidate_tree_sha256, shadow_diverged) = if shadow_enabled {
             let legacy_hash = sha256_hex(rendered.as_bytes());
-            let candidate_hash = candidate_nodes
-                .as_ref()
-                .map(|candidate| sha256_hex(render(&self.title, &self.url, candidate).as_bytes()));
+            let candidate_hash = candidate_nodes.as_ref().map(|candidate| {
+                sha256_hex(render_nested(&self.title, &self.url, candidate).as_bytes())
+            });
             let diverged = candidate_hash
                 .as_ref()
                 .map(|candidate| candidate != &legacy_hash);
@@ -1685,7 +1706,7 @@ impl BrowserSession {
     pub async fn rebuild_tree(&mut self) -> Result<String, CoreError> {
         let (raw, node_sessions) = self.driver.get_full_ax_tree_with_sessions().await?;
         let (nodes, map) = compress(&raw);
-        let rendered = render(&self.title, &self.url, &nodes);
+        let rendered = render_nested(&self.title, &self.url, &nodes);
         self.action_sessions = build_action_sessions(&nodes, &node_sessions);
         self.action_map = map;
         self.last_tree = rendered.clone();
@@ -2111,7 +2132,7 @@ impl BrowserSession {
         loop {
             let state = self
                 .driver
-                .evaluate("`${document.readyState}|${document.getElementsByTagName('*').length}|${document.body ? document.body.innerText.length : 0}`")
+                .evaluate(SETTLE_DOM_STATS_JS)
                 .await
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string));

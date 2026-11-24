@@ -14,6 +14,117 @@ use crate::interceptor;
 use crate::resource_policy::ResourcePolicy;
 use crate::CoreError;
 
+const CLICKABLE_NON_ARIA_SCRIPT: &str = r#"(() => {
+  const skipTags = new Set(['A', 'BUTTON', 'INPUT', 'SELECT', 'TEXTAREA', 'SUMMARY', 'LABEL', 'OPTION']);
+  const out = [];
+  const walk = (root) => {
+    for (const el of root.querySelectorAll('*')) {
+      if (out.length >= 48) break;
+      if (el.shadowRoot) walk(el.shadowRoot);
+      if (skipTags.has(el.tagName)) continue;
+      if (el.hasAttribute('role')) continue;
+      if (!el.hasAttribute('onclick') && typeof el.onclick !== 'function') continue;
+      const st = getComputedStyle(el);
+      if (st.display === 'none' || st.visibility === 'hidden') continue;
+      if (el.getClientRects().length === 0) continue;
+      out.push(el);
+    }
+  };
+  walk(document);
+  return out.length ? out : null;
+})()"#;
+
+async fn collect_clickable_non_aria_backends(
+    client: &Arc<CdpClient>,
+    session_id: &str,
+) -> HashSet<i64> {
+    let Ok(eval) = client
+        .send(
+            Some(session_id),
+            "Runtime.evaluate",
+            serde_json::json!({
+                "expression": CLICKABLE_NON_ARIA_SCRIPT,
+                "returnByValue": false,
+            }),
+        )
+        .await
+    else {
+        return HashSet::new();
+    };
+    let Some(array_object_id) = eval
+        .get("result")
+        .and_then(|r| r.get("objectId"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        return HashSet::new();
+    };
+    let Ok(props) = client
+        .send(
+            Some(session_id),
+            "Runtime.getProperties",
+            serde_json::json!({
+                "objectId": array_object_id,
+                "ownProperties": true,
+            }),
+        )
+        .await
+    else {
+        return HashSet::new();
+    };
+    let elem_ids: Vec<String> = props
+        .get("result")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|entry| {
+            entry
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.chars().all(|c| c.is_ascii_digit()))
+        })
+        .filter_map(|entry| {
+            entry
+                .get("value")
+                .and_then(|v| v.get("objectId"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    let backends: Vec<i64> = stream::iter(elem_ids)
+        .map(|object_id| {
+            let client = client.clone();
+            let sid = session_id.to_string();
+            async move {
+                client
+                    .send(
+                        Some(&sid),
+                        "DOM.describeNode",
+                        serde_json::json!({ "objectId": object_id }),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|res| {
+                        res.get("node")
+                            .and_then(|n| n.get("backendNodeId"))
+                            .and_then(Value::as_i64)
+                    })
+            }
+        })
+        .buffer_unordered(8)
+        .filter_map(|b| async move { b })
+        .collect()
+        .await;
+    let _ = client
+        .send(
+            Some(session_id),
+            "Runtime.releaseObject",
+            serde_json::json!({ "objectId": array_object_id }),
+        )
+        .await;
+    backends.into_iter().collect()
+}
+
 /// CDP-backed browser operations for one flattened page target.
 #[derive(Clone)]
 pub struct CdpDriver {
@@ -63,11 +174,31 @@ impl CdpDriver {
     pub async fn get_full_ax_tree_with_sessions(
         &self,
     ) -> Result<(Vec<accessibility::AXNode>, HashMap<String, FrameSession>), CoreError> {
-        let (main_res, frame_res) = tokio::join!(
+        let (main_res, clickable_backends, frame_res) = tokio::join!(
             accessibility::get_full_ax_tree(&self.client, &self.session_id),
+            collect_clickable_non_aria_backends(&self.client, &self.session_id),
             page::get_frame_tree(&self.client, &self.session_id)
         );
         let mut all_nodes = main_res?.nodes;
+        if !clickable_backends.is_empty() {
+            for node in &mut all_nodes {
+                if node
+                    .backend_node_id
+                    .is_some_and(|id| clickable_backends.contains(&id))
+                {
+                    let props = node.properties.get_or_insert_with(Vec::new);
+                    if !props.iter().any(|p| p.name == "clickable") {
+                        props.push(accessibility::AXProperty {
+                            name: "clickable".to_string(),
+                            value: Some(accessibility::AXValue {
+                                type_: Some("boolean".to_string()),
+                                value: Some(Value::Bool(true)),
+                            }),
+                        });
+                    }
+                }
+            }
+        }
         let mut node_sessions: HashMap<String, FrameSession> = HashMap::new();
 
         let Ok(ft) = frame_res else {

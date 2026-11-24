@@ -291,6 +291,67 @@ fn ancestor_value_matches(
     false
 }
 
+fn is_clickable_non_aria_role(role: &str) -> bool {
+    matches!(
+        role,
+        "generic"
+            | "genericcontainer"
+            | "none"
+            | "presentation"
+            | "group"
+            | "section"
+            | "paragraph"
+            | "image"
+    )
+}
+
+/// Collect `derive_name` parts and the `StaticText` node IDs they came from.
+fn derive_name_with_sources<'a>(
+    node_id: &str,
+    children_of: &HashMap<&str, Vec<&'a str>>,
+    index: &HashMap<&str, &'a AXNode>,
+) -> (String, Vec<&'a str>) {
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    let mut sources: Vec<&'a str> = Vec::with_capacity(4);
+    let mut stack: Vec<&'a str> = children_of
+        .get(node_id)
+        .map(|v| v.to_vec())
+        .unwrap_or_default();
+    stack.reverse();
+    let mut visited: usize = 0;
+    while let Some(id) = stack.pop() {
+        visited += 1;
+        if visited > 64 {
+            break;
+        }
+        let Some(child) = index.get(id) else { continue };
+        if child.ignored {
+            continue;
+        }
+        let role = ax_role(child);
+        if ACTIONABLE_ROLES.contains(&role.as_str()) {
+            continue;
+        }
+        if role == "statictext" {
+            let text = ax_name(child);
+            if !text.is_empty() {
+                parts.push(text);
+                sources.push(id);
+                if parts.len() >= 6 {
+                    break;
+                }
+            }
+        } else if role != "inlinetextbox" {
+            if let Some(kids) = children_of.get(id) {
+                for k in kids.iter().rev() {
+                    stack.push(k);
+                }
+            }
+        }
+    }
+    (parts.join(" ").trim().to_string(), sources)
+}
+
 /// Derive a node's text from its descendants (Chromium leaves `name` empty
 /// when the text is owned by child nodes).
 ///
@@ -708,6 +769,57 @@ fn compress_pruned(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
     // the agent reads the page the way it is laid out.
     let ordered = document_order(nodes, &children_of, &parent_of);
 
+    // Bottom-up pass: identify visible non-ARIA elements with explicit click
+    // handlers (`clickable: true`), avoiding wrappers around already-actionable
+    // descendants and recording which StaticText nodes they absorb.
+    let mut clickable_non_aria: HashMap<&str, String> = HashMap::new();
+    let mut suppressed_by_clickable: HashSet<&str> = HashSet::new();
+    {
+        let mut subtree_has_actionable: HashSet<&str> = HashSet::new();
+        for node in ordered.iter().rev() {
+            let id = node.node_id.as_str();
+            let role = role_of.get(id).map(String::as_str).unwrap_or("");
+            let self_aria_actionable =
+                !node.ignored && ACTIONABLE_ROLES.contains(&role) && node.backend_node_id.is_some();
+            let child_has_actionable = children_of
+                .get(id)
+                .is_some_and(|kids| kids.iter().any(|k| subtree_has_actionable.contains(*k)));
+            if !child_has_actionable
+                && !self_aria_actionable
+                && !node.ignored
+                && node.backend_node_id.is_some()
+                && is_clickable_non_aria_role(role)
+                && node.prop_bool("clickable")
+            {
+                let own = ax_name(node);
+                if !own.is_empty() {
+                    let (_, sources) = derive_name_with_sources(id, &children_of, &index);
+                    for src in sources {
+                        if let Some(src_node) = index.get(src) {
+                            let src_text = ax_name(src_node);
+                            if !src_text.is_empty() && own.contains(&src_text) {
+                                suppressed_by_clickable.insert(src);
+                            }
+                        }
+                    }
+                    clickable_non_aria.insert(id, own);
+                    subtree_has_actionable.insert(id);
+                } else {
+                    let (derived, sources) = derive_name_with_sources(id, &children_of, &index);
+                    if !derived.is_empty() {
+                        for src in sources {
+                            suppressed_by_clickable.insert(src);
+                        }
+                        clickable_non_aria.insert(id, derived);
+                        subtree_has_actionable.insert(id);
+                    }
+                }
+            } else if self_aria_actionable || child_has_actionable {
+                subtree_has_actionable.insert(id);
+            }
+        }
+    }
+
     // ---- Pass 1: assign action IDs -------------------------------------
     //
     // The IDs must be known before the tree is rendered, because a table
@@ -727,7 +839,9 @@ fn compress_pruned(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
                 .get(node.node_id.as_str())
                 .map(String::as_str)
                 .unwrap_or("");
-            if !ACTIONABLE_ROLES.contains(&role) {
+            if !ACTIONABLE_ROLES.contains(&role)
+                && !clickable_non_aria.contains_key(node.node_id.as_str())
+            {
                 continue;
             }
             if node.backend_node_id.is_none() {
@@ -815,6 +929,28 @@ fn compress_pruned(nodes: &[AXNode]) -> (Vec<SemanticNode>, ActionMap) {
         // InlineTextBox is pure layout noise - always drop.
         if role == "inlinetextbox" {
             continue;
+        }
+        if suppressed_by_clickable.contains(node.node_id.as_str()) {
+            continue;
+        }
+        if let Some(clickable_name) = clickable_non_aria.get(node.node_id.as_str()) {
+            if let Some(id) = id_of_node.get(node.node_id.as_str()) {
+                let emit_role = if role == "image" {
+                    "image".to_string()
+                } else {
+                    "clickable".to_string()
+                };
+                out.push(SemanticNode {
+                    action_id: Some(*id),
+                    role: emit_role,
+                    name: clickable_name.clone(),
+                    extras: ax_extras(node, role),
+                    level: None,
+                    node_id: node.node_id.clone(),
+                    depth: node_depth(node.node_id.as_str(), &parent_of),
+                });
+                continue;
+            }
         }
         // StaticText duplicating an ancestor's accessible name (e.g. a table
         // cell whose name is the concatenation of its children).
@@ -1250,5 +1386,48 @@ mod tests {
             .filter(|n| n.name.contains("Linked item"))
             .count();
         assert_eq!(occurrences, 1, "link text duplicated: {out:?}");
+    }
+
+    #[test]
+    fn clickable_non_aria_div_gets_action_id_without_duplicating_text_or_wrapping_buttons() {
+        let mut clickable_div = node("2", "generic", "", Some(20));
+        clickable_div.properties = Some(vec![AXProperty {
+            name: "clickable".to_string(),
+            value: Some(AXValue {
+                type_: Some("boolean".to_string()),
+                value: Some(serde_json::Value::Bool(true)),
+            }),
+        }]);
+        let mut wrapper_div = node("4", "generic", "", Some(40));
+        wrapper_div.properties = Some(vec![AXProperty {
+            name: "clickable".to_string(),
+            value: Some(AXValue {
+                type_: Some("boolean".to_string()),
+                value: Some(serde_json::Value::Bool(true)),
+            }),
+        }]);
+        let nodes = vec![
+            with_children(node("1", "generic", "", None), &["2", "4"]),
+            with_children(clickable_div, &["3"]),
+            node("3", "statictext", "Custom Div", None),
+            with_children(wrapper_div, &["5"]),
+            with_children(node("5", "button", "Real Button", Some(50)), &["6"]),
+            node("6", "statictext", "Real Button", None),
+        ];
+        let (out, map) = compress(&nodes);
+        assert_eq!(map.get(&1), Some(&20));
+        assert_eq!(map.get(&2), Some(&50));
+        assert_eq!(map.len(), 2, "wrapper div must not duplicate button action");
+        assert_eq!(
+            out.len(),
+            2,
+            "child statictext must not be duplicated: {out:?}"
+        );
+        assert_eq!(out[0].action_id, Some(1));
+        assert_eq!(out[0].role, "clickable");
+        assert_eq!(out[0].name, "Custom Div");
+        assert_eq!(out[1].action_id, Some(2));
+        assert_eq!(out[1].role, "button");
+        assert_eq!(out[1].name, "Real Button");
     }
 }
