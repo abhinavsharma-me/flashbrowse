@@ -37,11 +37,21 @@ pub async fn run(
     };
     let mut session = BrowserSession::launch(config).await?;
     let result = session.open(&url).await;
+    // Capture the settle breakdown before the session is consumed below.
+    let settle = session.last_settle().cloned();
     match result {
         Err(e) => {
             session.shutdown().await;
             let msg = e.to_string();
-            observability::record_op("open", &url, started, None, false, Some(msg.clone()));
+            observability::record_op_with_settle(
+                "open",
+                &url,
+                started,
+                None,
+                false,
+                Some(msg.clone()),
+                settle,
+            );
             return Err(e.into());
         }
         Ok(tree) => {
@@ -61,7 +71,15 @@ pub async fn run(
                     session.shutdown().await;
                 }
             }
-            observability::record_op("open", &url, started, Some(payload), true, None);
+            observability::record_op_with_settle(
+                "open",
+                &url,
+                started,
+                Some(payload),
+                true,
+                None,
+                settle,
+            );
         }
     }
     Ok(())

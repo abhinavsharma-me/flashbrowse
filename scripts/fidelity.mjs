@@ -1,10 +1,9 @@
 #!/usr/bin/env node
 // Real-site fidelity check.
 //
-// For every URL, dump the raw AX tree and the compressed tree, then apply the
-// same rules as `crates/flashbrowse-core/tests/fidelity.rs`: every visible
-// StaticText must survive (truncation excepted), and decorative text inside a
-// named control is allowed to disappear with its parent.
+// For every URL, fetch the raw AX snapshot and rendered tree from one accepted
+// open, then apply the same rules as `crates/flashbrowse-core/tests/fidelity.rs`.
+// Comparing separate navigations can report changing timestamps as lost text.
 //
 // Sequential by design: one page at a time, one browser per dump.
 //
@@ -183,12 +182,12 @@ function analyze(rawNodes, tree) {
   };
 }
 
-async function dump(binary, url, format, timeout) {
-  const { stdout } = await run(binary, ["dump", url, "--format", format], {
+async function dumpSnapshot(binary, url, timeout) {
+  const { stdout } = await run(binary, ["dump", url, "--format", "fidelity"], {
     timeout,
     maxBuffer: 128 * 1024 * 1024,
   });
-  return stdout;
+  return JSON.parse(stdout);
 }
 
 function formatBytes(n) {
@@ -207,15 +206,13 @@ async function main() {
   for (const url of opts.urls) {
     const started = Date.now();
     try {
-      const rawText = await dump(opts.binary, url, "raw", opts.timeout);
-      const tree = await dump(opts.binary, url, "axtree", opts.timeout);
+      const { raw_nodes: raw, tree } = await dumpSnapshot(opts.binary, url, opts.timeout);
       const body = tree.split("\n---\n")[1] ?? "";
       if (body.trim().length === 0) {
         // A header-only tree means the navigation produced nothing usable.
         // Reporting it as a 100% reduction would be a lie.
         throw new Error("empty compressed tree (navigation likely failed)");
       }
-      const raw = JSON.parse(rawText);
       const result = analyze(raw, tree);
       pages.push({
         url,

@@ -98,7 +98,8 @@ enum Commands {
         /// hosts (localhost, 127.0.0.1, LAN addresses) use http.
         url: String,
         /// Output format: `markdown`, `axtree` (compressed flat list),
-        /// `axtree-nested` (compressed, indented by depth), or `raw`
+        /// `axtree-nested` (compressed, indented by depth), `raw`, or
+        /// `fidelity` (raw and rendered snapshots from one open)
         /// (uncompressed CDP AX tree as JSON).
         #[arg(long, default_value = "markdown")]
         format: String,

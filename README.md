@@ -82,7 +82,7 @@ flashbrowse setup                    # download managed Chrome-for-Testing (~120
 flashbrowse open <url>               # compressed action tree (ephemeral browser)
 flashbrowse open <url> --session-id s1   # ...and keep the browser alive
 flashbrowse act <id> --session-id s1 --action click --value ...
-flashbrowse dump <url> --format markdown|axtree|raw
+flashbrowse dump <url> --format markdown|axtree|raw|fidelity
 flashbrowse bench <url>              # latency + token self-measurement
 flashbrowse mcp                      # MCP stdio server for Claude Code / Cursor / Codex
 flashbrowse close --session-id s1    # stop a persistent browser
@@ -266,6 +266,11 @@ Observed 90-minute mixed soak (`5,401 s`, 7 local + public URLs):
 - **Latency & drift:** `p50 = 255 ms`, `p95 = 1,288 ms`, `drift_ratio = 0.985` (first-tenth `259 ms` -> last-tenth `255 ms`)
 - **Memory & cleanup:** `leak_gate.ok = true` (post-warmup `119,804 kB` -> `116,340 kB`, ratio `0.971`), **0** leaked Chrome processes at exit
 
+Observed v1.3.0 settle improvements (matched Chrome 147, sequential warm opens):
+- **Complex & nested pages (p95):** `a11y.html` `1,370 ms -> 445 ms` (-67.5%), `forms.html` `1,365 ms -> 454 ms` (-66.7%), `nested-depth.html` `15,194 ms -> 1,364 ms` (-91.0%)
+- **Simple pages (p50 / p95):** `table.html` `499 / 551 ms -> 502 / 526 ms` (p95 -25 ms), synthetic table `506 / 564 ms -> 507 / 522 ms` (p95 -42 ms)
+- **v1.3.0 release-gate 5-minute soak:** 451 tool calls (`148` iterations), **0 errors** (`0.00%`), `p50 = 257 ms`, `drift_ratio = 1.004`, steady-state RSS `+242 kB`, **0** leaked Chrome processes at exit
+
 ### What is blocked, and why
 
 Measured byte shares of a real page load (Chrome `Network.loadingFinished`):
@@ -303,8 +308,9 @@ flashbrowse waits for the tree to be *final*:
 
 1. cheap poll (one `Runtime.evaluate`) every 100 ms - `readyState`, DOM size,
    `innerText` length;
-2. the DOM must be quiet (250 ms static / 600 ms moving / 800 ms for a small
-   tree that may not have hydrated);
+2. the DOM must be quiet (250 ms for a provably static page or a large tree,
+   600 ms after observed changes, and 1200 ms for a small page that may still
+   hydrate);
 3. the browser must report `readyState == "complete"` (its own verdict that
    every JS bundle has loaded) - or the network must be idle;
 4. the AX tree must not be obviously empty while the DOM has content
@@ -351,6 +357,10 @@ dev-only harness is under [`eval/`](eval/).
 
 `dump --format raw` prints the uncompressed CDP AX tree, which is the ground
 truth the compressor is measured against.
+
+`dump --format fidelity` prints the raw AX nodes and rendered tree from the
+same accepted open. It supports fidelity diagnostics on pages whose text can
+change between navigations.
 
 ### Where the rivals still win
 

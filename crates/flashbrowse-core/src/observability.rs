@@ -50,6 +50,74 @@ pub struct MetricRecord {
     /// Error message (when it failed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Per-open settle timing breakdown (see [`SettleBreakdown`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settle: Option<SettleBreakdown>,
+}
+
+/// Wall-clock attribution of one `BrowserSession::open` settle.
+///
+/// Every stage of the settle loop is timed so a latency claim can be checked
+/// against evidence instead of a guess. All durations are milliseconds.
+///
+/// The stages are deliberately disjoint: `nav_ms` covers only the
+/// `Page.navigate` round-trip, `poll_ms` only the cheap readiness evaluates,
+/// `sleep_ms` only the fixed inter-poll sleeps, `ax_fetch_ms` only
+/// `Accessibility.getFullAXTree`, `compress_ms` only compress + fingerprint,
+/// and `render_ms` only the final render. Whatever is left over is CDP
+/// serialization and the remaining bookkeeping.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SettleBreakdown {
+    /// `Page.navigate` round-trip.
+    pub nav_ms: u64,
+    /// Cheap readiness polls (`Runtime.evaluate`).
+    pub poll_ms: u64,
+    /// Fixed inter-poll sleeps inside the settle loop.
+    pub sleep_ms: u64,
+    /// `Accessibility.getFullAXTree` calls made by the settle loop.
+    pub ax_fetch_ms: u64,
+    /// Compress + fingerprint of each fetched tree.
+    pub compress_ms: u64,
+    /// Initial and post-settle title/URL reads.
+    pub title_url_ms: u64,
+    /// Render of the final tree.
+    pub render_ms: u64,
+    /// Settle-loop iterations.
+    pub iterations: u64,
+    /// AX tree fetches inside the settle loop.
+    pub ax_fetches: u64,
+    /// Why the settle ended: `settled`, `deadline`, `empty` or `error`.
+    pub exit_reason: String,
+    /// Shadow candidate acceptance offset from the start of `open`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_accept_ms: Option<u64>,
+    /// SHA-256 of the rendered tree accepted by the legacy decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub legacy_tree_sha256: Option<String>,
+    /// SHA-256 of the rendered tree accepted by the shadow candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_tree_sha256: Option<String>,
+    /// Whether the two rendered trees differ byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow_diverged: Option<bool>,
+    /// Final raw Chromium AX node count.
+    #[serde(default)]
+    pub raw_ax_nodes: u64,
+    /// Final compressed semantic node count.
+    #[serde(default)]
+    pub semantic_nodes: u64,
+    /// MutationObserver records since navigation, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_count: Option<u64>,
+    /// `performance.now()` timestamp of the last mutation in the document.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_last_ms: Option<u64>,
+    /// Milliseconds since the last observed DOM mutation at candidate accept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_quiet_ms: Option<u64>,
+    /// Whether the observer would have extended the candidate's quiet window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_would_delay_candidate: Option<bool>,
 }
 
 impl MetricRecord {
@@ -64,7 +132,14 @@ impl MetricRecord {
             actions: 0,
             ok: true,
             error: None,
+            settle: None,
         }
+    }
+
+    /// Attach the settle breakdown (open operations only).
+    pub fn with_settle(mut self, settle: SettleBreakdown) -> Self {
+        self.settle = Some(settle);
+        self
     }
 
     /// Attach the payload size.
@@ -116,10 +191,26 @@ pub fn record_op(
     ok: bool,
     error: Option<String>,
 ) -> MetricRecord {
+    record_op_with_settle(op, target, started, payload, ok, error, None)
+}
+
+/// Like [`record_op`], with an optional settle breakdown for open operations.
+pub fn record_op_with_settle(
+    op: &str,
+    target: &str,
+    started: std::time::Instant,
+    payload: Option<(usize, usize)>,
+    ok: bool,
+    error: Option<String>,
+    settle: Option<SettleBreakdown>,
+) -> MetricRecord {
     let ms = started.elapsed().as_millis() as u64;
     let mut r = MetricRecord::new(op, target, ms);
     if let Some((chars, actions)) = payload {
         r = r.with_payload(chars, actions);
+    }
+    if let Some(s) = settle {
+        r = r.with_settle(s);
     }
     if !ok {
         r = r.failed(error.unwrap_or_else(|| "unknown error".to_string()));

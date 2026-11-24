@@ -78,30 +78,51 @@ pub async fn run(
     );
 
     let mut any_fail = false;
+    let mut last_settle = None;
     for url in &targets {
         match bench_one(url, chrome_path.clone(), resource_policy).await {
-            Ok(row) => println!(
-                "{:<38} {:>8}t {:>10}t {:>8}ms {:>7}{}",
-                trim_url(url),
-                row.raw_tokens,
-                row.ax_tokens,
-                row.latency_ms,
-                row.rss_mb
-                    .map(|m| format!("{m:.0}M"))
-                    .unwrap_or_else(|| "n/a".to_string()),
-                if row.raw_tokens > 0 && row.ax_tokens > 0 {
-                    format!(
-                        "  ({:.0}% reduction)",
-                        (1.0 - row.ax_tokens as f64 / row.raw_tokens as f64) * 100.0
-                    )
-                } else {
-                    String::new()
-                }
-            ),
+            Ok(row) => {
+                last_settle = row.settle.clone();
+                println!(
+                    "{:<38} {:>8}t {:>10}t {:>8}ms {:>7}{}",
+                    trim_url(url),
+                    row.raw_tokens,
+                    row.ax_tokens,
+                    row.latency_ms,
+                    row.rss_mb
+                        .map(|m| format!("{m:.0}M"))
+                        .unwrap_or_else(|| "n/a".to_string()),
+                    if row.raw_tokens > 0 && row.ax_tokens > 0 {
+                        format!(
+                            "  ({:.0}% reduction)",
+                            (1.0 - row.ax_tokens as f64 / row.raw_tokens as f64) * 100.0
+                        )
+                    } else {
+                        String::new()
+                    }
+                );
+                println!("{:<38} browser startup {}ms", "", row.startup_ms);
+            }
             Err(e) => {
                 any_fail = true;
                 println!("{:<38} FAIL: {e}", trim_url(url));
             }
+        }
+        if let Some(s) = last_settle.take() {
+            println!(
+                "{:<38} settle nav {}ms poll {}ms sleep {}ms ax {}ms/{} compress {}ms title {}ms render {}ms iters {} ({})",
+                "",
+                s.nav_ms,
+                s.poll_ms,
+                s.sleep_ms,
+                s.ax_fetch_ms,
+                s.ax_fetches,
+                s.compress_ms,
+                s.title_url_ms,
+                s.render_ms,
+                s.iterations,
+                s.exit_reason
+            );
         }
     }
     let joined = targets.join(",");
@@ -124,7 +145,9 @@ struct BenchRow {
     raw_tokens: usize,
     ax_tokens: usize,
     latency_ms: u128,
+    startup_ms: u128,
     rss_mb: Option<f64>,
+    settle: Option<flashbrowse_core::observability::SettleBreakdown>,
 }
 
 async fn bench_one(
@@ -138,7 +161,9 @@ async fn bench_one(
         ..Default::default()
     };
     let start = Instant::now();
+    let startup_start = Instant::now();
     let mut session = BrowserSession::launch(config).await?;
+    let startup_ms = startup_start.elapsed().as_millis();
     let tree = match session.open(url).await {
         Ok(t) => t,
         Err(e) => {
@@ -147,6 +172,7 @@ async fn bench_one(
         }
     };
     let latency_ms = start.elapsed().as_millis();
+    let settle = session.last_settle().cloned();
     let pid = session.pid();
 
     // Raw HTML token estimate from in-page outerHTML.
@@ -174,7 +200,9 @@ async fn bench_one(
         raw_tokens: token_estimate(raw_chars),
         ax_tokens: token_estimate(tree_chars),
         latency_ms,
+        startup_ms,
         rss_mb: rss,
+        settle,
     })
 }
 

@@ -80,12 +80,36 @@ pub const STEALTH_SCRIPT: &str = r#"(() => {
       return getParameter.call(this, parameter);
     };
   } catch (_) {}
+
+})();
+"#;
+
+/// Additional page instrumentation used only by the settle shadow benchmark.
+pub const SETTLE_DIAGNOSTICS_SCRIPT: &str = r#"(() => {
+  try {
+    const state = { count: 0, last_ms: 0 };
+    Object.defineProperty(window, '__flashbrowseMutationState', {
+      configurable: false,
+      enumerable: false,
+      value: state
+    });
+    const observer = new MutationObserver((records) => {
+      state.count += records.length;
+      state.last_ms = performance.now();
+    });
+    observer.observe(document, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+      attributes: true
+    });
+  } catch (_) {}
 })();
 "#;
 
 #[cfg(test)]
 mod tests {
-    use super::STEALTH_SCRIPT;
+    use super::{SETTLE_DIAGNOSTICS_SCRIPT, STEALTH_SCRIPT};
 
     #[test]
     fn script_contains_key_evasions() {
@@ -102,5 +126,12 @@ mod tests {
                 "stealth script missing: {needle}"
             );
         }
+    }
+
+    #[test]
+    fn mutation_observer_is_separate_from_default_stealth_script() {
+        assert!(!STEALTH_SCRIPT.contains("MutationObserver"));
+        assert!(SETTLE_DIAGNOSTICS_SCRIPT.contains("MutationObserver"));
+        assert!(SETTLE_DIAGNOSTICS_SCRIPT.contains("__flashbrowseMutationState"));
     }
 }

@@ -268,7 +268,9 @@ async fn screenshot_timeout_is_capped() {
     session.shutdown().await;
 }
 
-/// A page with fewer than three semantic nodes must still settle quickly.
+/// In shadow mode, the legacy decision remains authoritative until the
+/// candidate clears the accuracy and latency gates. Both decisions must
+/// settle without hitting the 15 second deadline.
 ///
 /// The settle loop used to require `nodes.len() >= 3` before accepting a
 /// tree, so a minimal page ("<h1>Hi</h1>") never satisfied the exit
@@ -279,7 +281,7 @@ async fn minimal_page_settles_quickly() {
         eprintln!("SKIP: no Chromium binary found");
         return;
     }
-    let port = spawn_server();
+    let port = spawn_server_with("<html><body><h1>Hi</h1></body></html>");
     let url = format!("http://127.0.0.1:{port}/");
 
     let mut session = BrowserSession::launch(SessionConfig::default())
@@ -291,9 +293,43 @@ async fn minimal_page_settles_quickly() {
 
     assert!(!tree.is_empty(), "the tree must not be empty");
     assert!(
-        elapsed < std::time::Duration::from_secs(5),
-        "a minimal page took {elapsed:?} to settle - the exit condition \
-         probably still requires a minimum tree size"
+        elapsed < std::time::Duration::from_secs(3),
+        "a minimal page took {elapsed:?} to settle - shadow acceptance did not converge"
+    );
+    session.shutdown().await;
+}
+
+#[tokio::test]
+async fn sparse_complete_ax_tree_does_not_hit_settle_deadline() {
+    if no_chrome() {
+        eprintln!("SKIP: no Chromium binary found");
+        return;
+    }
+    let html = "<html><body><div id='root'></div><script>let el=document.getElementById('root');for(let i=0;i<80;i++){const next=document.createElement('el-'+i);el.appendChild(next);el=next;}el.textContent='deep-leaf-token';</script></body></html>";
+    let port = spawn_server_with(html);
+    let url = format!("http://127.0.0.1:{port}/");
+
+    let mut session = BrowserSession::launch(SessionConfig::default())
+        .await
+        .expect("launch");
+    let started = std::time::Instant::now();
+    let tree = session.open(&url).await.expect("open");
+    let elapsed = started.elapsed();
+
+    assert!(
+        tree.contains("deep-leaf-token"),
+        "the only page text must survive"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "a complete sparse AX tree took {elapsed:?} to settle"
+    );
+    assert_eq!(
+        session
+            .last_settle()
+            .map(|settle| settle.exit_reason.as_str()),
+        Some("settled"),
+        "the open must settle from a stable AX snapshot, not the deadline"
     );
     session.shutdown().await;
 }
@@ -327,6 +363,33 @@ document.getElementById('t').innerHTML = '<a href=\"/late\">late link</a>';\
     assert!(
         tree.contains("late link"),
         "content hydrated 1.2 s after load was truncated:\n{tree}"
+    );
+    session.shutdown().await;
+}
+
+/// Same-length text and ARIA changes must reset settling through mutations.
+#[tokio::test]
+async fn same_length_aria_change_is_captured() {
+    if no_chrome() {
+        eprintln!("SKIP: no Chromium binary found");
+        return;
+    }
+    let html = "<html><body><button id='b' aria-label='Before'>Click</button>\
+<script>setTimeout(() => document.getElementById('b').setAttribute('aria-label', 'After!'), 500)</script>\
+</body></html>";
+    let port = spawn_server_with(html);
+    let url = format!("http://127.0.0.1:{port}/");
+    let mut session = BrowserSession::launch(SessionConfig::default())
+        .await
+        .expect("launch");
+    let tree = session.open(&url).await.expect("open");
+    assert!(
+        tree.contains("After!"),
+        "same-length aria-label update was missed: {tree}"
+    );
+    assert!(
+        !tree.contains("Before"),
+        "stale aria-label remained in tree: {tree}"
     );
     session.shutdown().await;
 }

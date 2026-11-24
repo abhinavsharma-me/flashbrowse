@@ -4,6 +4,32 @@ All notable changes. Format: [Keep a Changelog](https://keepachangelog.com/en/1.
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-24
+
+### Added
+- `dump --format fidelity`: prints both the raw CDP AX nodes and the compressed
+  rendered tree from the same accepted open for single-observation fidelity
+  diagnostics.
+- `scripts/settle_bench.mjs`: sequential warm-open settle benchmark harness
+  recording per-open SHA-256 tree determinism, latency percentiles, and settle
+  stage breakdowns.
+- `SettleBreakdown` timing instrumentation in `observability` (and optional
+  `FLASHBROWSE_SETTLE_SHADOW=1` diagnostics).
+
+### Changed
+- Settle loop now correlates `Page.lifecycleEvent` (`commit` / `load`) and
+  `Accessibility.loadComplete` with adaptive DOM quiet windows (250 ms for
+  provably static or large trees, 600 ms after observed changes, 1,200 ms for
+  small pages that may still hydrate).
+- Same-length ARIA/text mutations are now detected reliably during settle
+  fingerprinting instead of treating equal-length trees as unchanged.
+
+### Fixed
+- Eliminated deadline-stall tail latency on complex and deeply nested pages in
+  matched Chrome 147 benchmarks: `a11y.html` p95 improved from 1,370 ms to
+  445 ms (-67.5%), `forms.html` p95 from 1,365 ms to 454 ms (-66.7%), and
+  `nested-depth.html` p95 from 15,194 ms to 1,364 ms (-91.0%).
+
 ## [1.2.1] - 2026-11-23
 
 ### Changed

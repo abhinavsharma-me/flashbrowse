@@ -251,8 +251,7 @@ async fn stress_real_world_tokens() {
     }
 }
 
-/// Truncation guard: the same page opened repeatedly must always produce a
-/// complete tree (never a pre-hydration snapshot).
+/// Truncation guard: repeated opens must produce complete, byte-identical trees.
 ///
 /// This is the regression test for the "145 tokens instead of 1770" bug:
 /// Chromium populates the AX tree ~400 ms after `load`, so a naive snapshot
@@ -275,25 +274,31 @@ async fn stress_no_truncation_across_repeats() {
         Array.from({length: 40}, (_, i) => '<p>Row ' + i + '</p>').join('');\
         </script></body></html>";
 
-    let mut sizes = Vec::new();
-    for _ in 0..5 {
-        let tree = session.open(html).await.expect("open");
-        let chars = tree.len();
-        assert!(
-            chars > 200,
-            "tree truncated to {chars} chars - expected the hydrated content"
-        );
-        assert!(tree.contains("Ready"), "button missing from tree");
-        sizes.push(chars);
+    let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+    let mut pages = vec![("hydration", html.to_string())];
+    for name in ["lazy-tabs.html", "modal-dialog.html", "heavy-table.html"] {
+        pages.push((name, format!("file://{}", fixture_dir.join(name).display())));
     }
-    let min = *sizes.iter().min().unwrap();
-    let max = *sizes.iter().max().unwrap();
-    println!("STRESS-NO-TRUNC x5: sizes={sizes:?} (min {min}, max {max})");
-    // Same page -> same tree size (small tolerance for dynamic content).
-    assert!(
-        (max - min) as f64 / (max as f64) < 0.20,
-        "tree size unstable across opens: {sizes:?}"
-    );
+    for (name, page) in pages {
+        let mut expected: Option<String> = None;
+        for iteration in 0..20 {
+            let tree = session.open(&page).await.expect("open");
+            let marker = match name {
+                "hydration" => "Ready",
+                "lazy-tabs.html" => "Panel one visible",
+                "modal-dialog.html" => "Open dialog",
+                "heavy-table.html" => "sku-0200",
+                _ => unreachable!(),
+            };
+            assert!(tree.contains(marker), "{name} missing {marker:?} from tree");
+            if let Some(first) = &expected {
+                assert_eq!(&tree, first, "{name} changed on repeat open {iteration}");
+            } else {
+                expected = Some(tree);
+            }
+        }
+        println!("STRESS-NO-TRUNC {name} x20: exact tree equality");
+    }
 
     session.shutdown().await;
 }

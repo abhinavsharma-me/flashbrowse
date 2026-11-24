@@ -17,7 +17,7 @@ use crate::engine::BrowserEngine;
 use crate::interceptor::{blocked_patterns, blocked_patterns_for_screenshot};
 use crate::markdown::EXTRACT_SCRIPT;
 use crate::resource_policy::ResourcePolicy;
-use crate::stealth::STEALTH_SCRIPT;
+use crate::stealth::{SETTLE_DIAGNOSTICS_SCRIPT, STEALTH_SCRIPT};
 use crate::tree::{compress, render, ActionMap};
 
 /// Errors surfaced by the core engine (maps to MCP `tools/call` error).
@@ -69,6 +69,10 @@ impl SessionConfig {
         }
         Ok(())
     }
+}
+
+fn settle_shadow_enabled() -> bool {
+    std::env::var("FLASHBROWSE_SETTLE_SHADOW").is_ok_and(|value| value == "1")
 }
 
 /// Options for [`BrowserSession::screenshot`].
@@ -224,6 +228,16 @@ pub struct BrowserSession {
     title: String,
     url: String,
     last_tree: String,
+    /// Timing breakdown of the most recent `open` (Phase 0 instrumentation).
+    last_settle: Option<crate::observability::SettleBreakdown>,
+}
+
+/// Legacy settle result kept while the candidate is measured in shadow mode.
+struct SettleSnapshot {
+    nodes: Vec<crate::tree::SemanticNode>,
+    map: ActionMap,
+    action_sessions: HashMap<u32, FrameSession>,
+    raw_nodes: Vec<flashbrowse_cdp::protocol::accessibility::AXNode>,
 }
 
 impl BrowserSession {
@@ -267,6 +281,10 @@ impl BrowserSession {
                 blocked_patterns(config.resource_policy),
             )
         );
+        if settle_shadow_enabled() {
+            page::add_script_on_new_document(&client, &session_id, SETTLE_DIAGNOSTICS_SCRIPT)
+                .await?;
+        }
 
         let browser_ws_url = chrome.browser_ws_url().to_string();
         let net = NetActivity::new();
@@ -287,6 +305,7 @@ impl BrowserSession {
             title: String::new(),
             url: String::new(),
             last_tree: String::new(),
+            last_settle: None,
         })
     }
 
@@ -341,6 +360,10 @@ impl BrowserSession {
         );
         s_r?;
         b_r?;
+        if settle_shadow_enabled() {
+            page::add_script_on_new_document(&client, &session_id, SETTLE_DIAGNOSTICS_SCRIPT)
+                .await?;
+        }
 
         let net = NetActivity::new();
         net.attach(&client.events());
@@ -360,6 +383,7 @@ impl BrowserSession {
             title: String::new(),
             url: String::new(),
             last_tree: String::new(),
+            last_settle: None,
         };
         // Seed title/url + action_map so `act` never uses a blank map.
         // Propagate failures (H6): a blank map must not masquerade as
@@ -426,17 +450,49 @@ impl BrowserSession {
     /// Cost control: the first tree fetch is reused (never discarded), and
     /// title/url are fetched in the same round-trip batch.
     pub async fn open(&mut self, url: &str) -> Result<String, CoreError> {
+        self.open_with_raw_snapshot(url)
+            .await
+            .map(|(rendered, _)| rendered)
+    }
+
+    /// Open a URL and return the raw AX snapshot used for the authoritative
+    /// rendered tree. This is intended for fidelity diagnostics that must
+    /// compare both representations from the same browser observation.
+    pub async fn open_with_raw_snapshot(
+        &mut self,
+        url: &str,
+    ) -> Result<
+        (
+            String,
+            Vec<flashbrowse_cdp::protocol::accessibility::AXNode>,
+        ),
+        CoreError,
+    > {
         let t_open = std::time::Instant::now();
+        let shadow_enabled = settle_shadow_enabled();
+        // Subscribe before navigating: a broadcast channel only delivers
+        // events emitted after `subscribe`, so this cannot miss this
+        // navigation's AX completion. `Accessibility.enable` is already on
+        // (see `launch`/`attach`), so the event stream exists at zero cost.
+        let mut ax_complete_rx = self.client.events().subscribe("Accessibility.loadComplete");
+        // `Page.navigate` returns before the new document commits. Until the
+        // commit event for THIS navigation arrives, the DOM, the readyState
+        // and the AX tree all still belong to the previous page, so observing
+        // them would look like a page that changed the instant it loaded.
+        let mut lifecycle_rx = self.client.events().subscribe("Page.lifecycleEvent");
+        let t_nav = std::time::Instant::now();
         let nav = page::navigate(&self.client, &self.session_id, url).await?;
+        let nav_ms = t_nav.elapsed().as_millis() as u64;
+        let nav_loader = nav.loader_id.clone();
         // NOTE: we deliberately do NOT wait for the `load` event - it waits
         // for every subresource (8+ s on heavy pages) while the AX tree is
         // usually final much earlier. Readiness is decided by the settle loop
         // below (document parsed + AX tree complete vs DOM + tree quiet).
-        let _ = nav;
 
         self.url = url.to_string();
         let client_c = self.client.clone();
         let sid = self.session_id.clone();
+        let t_titles = std::time::Instant::now();
         let (title_r, url_r) = tokio::join!(
             runtime::evaluate(&client_c, &sid, "document.title"),
             runtime::evaluate(&client_c, &sid, "location.href")
@@ -455,6 +511,7 @@ impl BrowserSession {
                 }
             }
         }
+        let mut title_url_ms = t_titles.elapsed().as_millis() as u64;
         // Chrome error pages (network lost, DNS failure, ...) look like a
         // tiny page. Report them instead of returning a truncated tree.
         if self.url.starts_with("chrome-error://") {
@@ -469,6 +526,23 @@ impl BrowserSession {
         let mut map = ActionMap::new();
         let mut action_sessions: HashMap<u32, FrameSession> = HashMap::new();
         let mut fingerprint = 0u64;
+        // Phase 0 instrumentation: disjoint stage timers, reported through
+        // `SettleBreakdown` so a speedup claim can be checked against evidence.
+        let mut poll_ms = 0u64;
+        let mut sleep_ms = 0u64;
+        let mut ax_fetch_ms = 0u64;
+        let mut compress_ms = 0u64;
+        let mut iterations = 0u64;
+        let mut ax_fetches = 0u64;
+        let mut exit_reason = "deadline";
+        let mut last_raw_nodes = Vec::new();
+        let mut mutation_count = None;
+        let mut mutation_last_ms = None;
+        let mut mutation_quiet_ms = None;
+        let mut mutation_would_delay_candidate = None;
+        let mut candidate_accept_ms = None;
+        let mut legacy_snapshot: Option<SettleSnapshot> = None;
+        let mut candidate_nodes: Option<Vec<crate::tree::SemanticNode>> = None;
 
         // Settle loop.
         //
@@ -503,10 +577,25 @@ impl BrowserSession {
         // deliver the HTML, so the budget must not be shorter than the CDP
         // call timeout we already allow elsewhere (15s).
         let deadline = tokio::time::Instant::now() + Duration::from_millis(15000);
+        // Poll more often without shortening the evidence window. Every
+        // acceptance still requires a stable AX fingerprint and full quiet
+        // interval.
+        let tick_ms: u64 = 100;
+        let prefetch_lead_ms: u64 = 150;
         let mut last_change = tokio::time::Instant::now();
         let mut prev_dom = (0u64, 0u64);
-        let mut saw_change = false;
+        let mut legacy_saw_change = false;
+        let mut candidate_saw_change = false;
+        let mut ax_complete = false;
+        // Same-document navigations carry no `loaderId`; the current document
+        // is the right one from the start.
+        let mut nav_committed = nav_loader.is_none();
+        // Defensive fallback: a page whose commit event never arrives must not
+        // hang the settle. After this, the loop trusts its own readyState and
+        // DOM checks as before.
+        let commit_fallback = tokio::time::Instant::now() + Duration::from_millis(3000);
         loop {
+            iterations += 1;
             // Deadline check FIRST: every `continue` path below must be
             // able to exit the loop (a page that keeps changing would
             // otherwise spin forever).
@@ -518,26 +607,88 @@ impl BrowserSession {
                 );
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Drain AX load-complete notifications for this navigation.
+            // Chrome emits `Accessibility.loadComplete` once the tree for the
+            // loaded document is fully populated, which is what separates a
+            // legitimately sparse tree from one that is merely early.
+            while ax_complete_rx.try_recv().is_ok() {
+                ax_complete = true;
+            }
+            // Wait for this navigation's document to commit before observing
+            // anything. Any event with the matching loaderId means the new
+            // document is now the one being polled.
+            while let Ok(ev) = lifecycle_rx.try_recv() {
+                let matches = match nav_loader.as_deref() {
+                    Some(loader) => ev.get("loaderId").and_then(|v| v.as_str()) == Some(loader),
+                    None => true,
+                };
+                if matches && !nav_committed {
+                    nav_committed = true;
+                    // The quiet window starts at commit: time spent before the
+                    // new document existed must not count as stillness.
+                    last_change = tokio::time::Instant::now();
+                }
+            }
+            if !nav_committed {
+                if tokio::time::Instant::now() >= commit_fallback {
+                    tracing::debug!("no commit lifecycle event; proceeding on own checks");
+                    nav_committed = true;
+                    last_change = tokio::time::Instant::now();
+                } else {
+                    if iterations > 1 {
+                        let t_sleep = std::time::Instant::now();
+                        tokio::time::sleep(Duration::from_millis(tick_ms)).await;
+                        sleep_ms += t_sleep.elapsed().as_millis() as u64;
+                    }
+                    continue;
+                }
+            }
+            // Give the new document (and Chromium's accessibility tree) a
+            // tick before the first observation. Fetching immediately after
+            // commit samples a pre-population tree, which then reads as a
+            // change at the end of the quiet window and costs a second full
+            // window. The tick is what keeps the settle at one window.
+            let t_sleep = std::time::Instant::now();
+            tokio::time::sleep(Duration::from_millis(tick_ms)).await;
+            sleep_ms += t_sleep.elapsed().as_millis() as u64;
 
             // (1) cheap change detection: is the document still moving?
             let mut ready_state = String::from("loading");
             let mut dom_count = 0u64;
             let mut text_len = 0u64;
-            if let Ok(cheap) = runtime::evaluate(
-                &self.client,
-                &self.session_id,
-                "document.readyState + '|' + document.getElementsByTagName('*').length + '|' + (document.body ? document.body.innerText.length : 0)",
-            )
-            .await
+            let mut provably_static = false;
+            let t_poll = std::time::Instant::now();
+            let needs_static_classification = raw_ax_nodes < 100 && !legacy_saw_change;
+            let cheap_expression = if shadow_enabled {
+                "document.readyState + '|' + document.getElementsByTagName('*').length + '|' + (document.body ? document.body.innerText.length : 0) + '|' + (document.scripts.length === 0 && document.querySelectorAll('iframe').length === 0 && !document.querySelector('meta[http-equiv=refresh]')) + '|' + (window.__flashbrowseMutationState?.count ?? 0) + '|' + (window.__flashbrowseMutationState?.last_ms ?? 0) + '|' + (window.__flashbrowseMutationState ? performance.now() - window.__flashbrowseMutationState.last_ms : 0)"
+            } else if needs_static_classification {
+                "document.readyState + '|' + document.getElementsByTagName('*').length + '|' + (document.body ? document.body.innerText.length : 0) + '|' + (document.scripts.length === 0 && document.querySelectorAll('iframe').length === 0 && !document.querySelector('meta[http-equiv=refresh]'))"
+            } else {
+                "document.readyState + '|' + document.getElementsByTagName('*').length + '|' + (document.body ? document.body.innerText.length : 0) + '|false'"
+            };
+            if let Ok(cheap) =
+                runtime::evaluate(&self.client, &self.session_id, cheap_expression).await
             {
                 if let Some(Value::String(s)) = cheap.result.value.as_ref() {
                     let mut it = s.split('|');
                     ready_state = it.next().unwrap_or("loading").to_string();
                     dom_count = it.next().unwrap_or("0").parse().unwrap_or(0);
                     text_len = it.next().unwrap_or("0").parse().unwrap_or(0);
+                    provably_static = it.next().unwrap_or("false") == "true";
+                    if shadow_enabled {
+                        mutation_count = it.next().and_then(|v| v.parse().ok());
+                        mutation_last_ms = it
+                            .next()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .map(|ms| ms.max(0.0) as u64);
+                        mutation_quiet_ms = it
+                            .next()
+                            .and_then(|v| v.parse::<f64>().ok())
+                            .map(|ms| ms.max(0.0) as u64);
+                    }
                 }
             }
+            poll_ms += t_poll.elapsed().as_millis() as u64;
             // "loading" = the document is still streaming; "interactive" = the
             // DOM is parsed but subresources (JS bundles!) are still coming;
             // "complete" = the browser considers the page fully loaded.
@@ -554,10 +705,10 @@ impl BrowserSession {
             } else if cheap_now != prev_dom {
                 prev_dom = cheap_now;
                 last_change = tokio::time::Instant::now();
-                saw_change = true;
+                legacy_saw_change = true;
+                candidate_saw_change = true;
                 continue;
             }
-
             // Quiet window:
             //   - the DOM was moving          -> wait longer (600 ms)
             //   - the tree is still small      -> wait longer (800 ms): a
@@ -565,14 +716,24 @@ impl BrowserSession {
             //     hydrated yet (nhrdev.com truncated to 140 tokens with a
             //     250 ms window);
             //   - a big, static tree           -> settle fast (250 ms).
-            let quiet_ms = if saw_change {
+            let legacy_quiet_ms = if legacy_saw_change {
                 QUIET_MS_DYNAMIC
-            } else if raw_ax_nodes < 100 {
+            } else if raw_ax_nodes < 100 && !provably_static {
                 QUIET_MS_SMALL_TREE
             } else {
                 QUIET_MS_STATIC
             };
-            let quiet_enough = last_change.elapsed() >= Duration::from_millis(quiet_ms);
+            let candidate_quiet_ms = if shadow_enabled && candidate_saw_change {
+                QUIET_MS_DYNAMIC
+            } else if raw_ax_nodes < 100 && !provably_static {
+                QUIET_MS_SMALL_TREE
+            } else {
+                QUIET_MS_STATIC
+            };
+            let legacy_quiet_enough =
+                last_change.elapsed() >= Duration::from_millis(legacy_quiet_ms);
+            let candidate_quiet_enough =
+                last_change.elapsed() >= Duration::from_millis(candidate_quiet_ms);
 
             // (2) the AX tree must not be obviously empty while the DOM
             // already has content.
@@ -585,17 +746,48 @@ impl BrowserSession {
             // A tree with a handful of nodes cannot be a real page (unless
             // the page itself is tiny) - treat it as "not populated yet".
             // `raw_ax_nodes == 0` means "not fetched yet" -> fetch now.
-            let tree_unready = raw_ax_nodes == 0 || (raw_ax_nodes < 20 && dom_count >= 20);
+            let tree_short = raw_ax_nodes == 0 || (raw_ax_nodes < 20 && dom_count >= 20);
+            // A short tree is final when Chrome itself reports the document's
+            // accessibility tree complete. Without this escape a page whose
+            // DOM is large but whose tree is legitimately tiny (deep wrapper
+            // chains that compress to a single text node) can never satisfy
+            // `tree_unready` and burns the whole 15 s deadline on every open.
+            // The stability gate is unchanged: the samples must still match
+            // across the quiet window.
+            let sparse_final = tree_short && ax_complete && page_complete;
+            // Chromium's completed accessibility tree can legitimately be
+            // sparse, so only keep waiting when the candidate lacks both
+            // completion signals.
+            let candidate_unready = tree_short && !sparse_final;
+            let legacy_unready =
+                raw_ax_nodes == 0 || (raw_ax_nodes < 20 && dom_count >= 20 && !sparse_final);
 
-            // Fetch the AX tree when the DOM settled OR when the tree looks
-            // unready (it must be refreshed while we wait for it - the
-            // previous tree may be stale).
-            if !quiet_enough && !tree_unready {
+            // Sample early enough that the confirming fetch lands as soon as
+            // the quiet window elapses. The two samples still bracket the
+            // window (they are ~PREFETCH_LEAD_MS apart), so the stability
+            // evidence is at least as strong as before, but acceptance no
+            // longer pays an extra poll interval plus a sleep.
+            let elapsed_ms = last_change.elapsed().as_millis() as u64;
+            let prefetch_due = prefetch_lead_ms > 0
+                && !candidate_quiet_enough
+                && elapsed_ms + prefetch_lead_ms >= candidate_quiet_ms;
+
+            // Fetch when the tree looks unready (it must be refreshed while
+            // we wait for it), when the DOM settled, or when the confirming
+            // sample is due.
+            if (legacy_snapshot.is_some() || (!legacy_unready && !legacy_quiet_enough))
+                && (candidate_accept_ms.is_some()
+                    || (!candidate_unready && !candidate_quiet_enough && !prefetch_due))
+            {
                 continue;
             }
 
             // (3) verify the AX tree itself
+            let t_fetch = std::time::Instant::now();
             let (fresh, node_sessions) = self.driver.get_full_ax_tree_with_sessions().await?;
+            ax_fetch_ms += t_fetch.elapsed().as_millis() as u64;
+            ax_fetches += 1;
+            let t_compress = std::time::Instant::now();
             let raw_ax_nodes_before = raw_ax_nodes;
             raw_ax_nodes = fresh.len();
             let (n2, m2) = compress(&fresh);
@@ -606,6 +798,7 @@ impl BrowserSession {
             nodes = n2;
             map = m2;
             fingerprint = fp2;
+            compress_ms += t_compress.elapsed().as_millis() as u64;
 
             let net_idle = self.net.idle(250);
             tracing::debug!(
@@ -614,7 +807,11 @@ impl BrowserSession {
                 raw_ax_nodes,
                 semantic = nodes.len(),
                 same,
-                quiet_enough,
+                legacy_quiet_enough,
+                candidate_quiet_enough,
+                ax_complete,
+                prefetch_due,
+                sparse_final,
                 net_idle,
                 "settle poll"
             );
@@ -632,24 +829,86 @@ impl BrowserSession {
             // compresses to one or two nodes, and requiring three made
             // every such page wait out the whole settle deadline.
             let first_fetch = raw_ax_nodes_before == 0;
-            if same
-                && ratio_ok
-                && !tree_unready
-                && !nodes.is_empty()
-                && quiet_enough
-                && (page_complete || net_idle)
-                && (!first_fetch || !saw_change)
-            {
+            let stable = same && ratio_ok && !nodes.is_empty() && (page_complete || net_idle);
+            let legacy_stable = stable
+                && (!first_fetch || !legacy_saw_change)
+                && legacy_quiet_enough
+                && !legacy_unready;
+            let candidate_stable = stable
+                && shadow_enabled
+                && (!first_fetch || !candidate_saw_change)
+                && candidate_quiet_enough
+                && !candidate_unready;
+            if legacy_stable && !shadow_enabled {
+                last_raw_nodes = fresh;
+                exit_reason = "settled";
                 break;
+            }
+            if legacy_stable && legacy_snapshot.is_none() {
+                legacy_snapshot = Some(SettleSnapshot {
+                    nodes: nodes.clone(),
+                    map: map.clone(),
+                    action_sessions: action_sessions.clone(),
+                    raw_nodes: fresh.clone(),
+                });
+            }
+            if candidate_stable && candidate_accept_ms.is_none() {
+                candidate_nodes = Some(nodes.clone());
+                candidate_accept_ms = Some(t_open.elapsed().as_millis() as u64);
+                mutation_would_delay_candidate =
+                    mutation_quiet_ms.map(|quiet| quiet < candidate_quiet_ms);
             }
             if !same {
                 // The tree still moves - restart the quiet window.
                 last_change = tokio::time::Instant::now();
+                // AX changes are evidence of dynamic page content just like
+                // DOM text changes. The next confirmation uses the existing
+                // dynamic quiet interval instead of treating the page as an
+                // untouched small tree and waiting another full 1200 ms.
+                if shadow_enabled && raw_ax_nodes_before > 0 {
+                    candidate_saw_change = true;
+                }
             }
+            last_raw_nodes = fresh;
+            if shadow_enabled && legacy_snapshot.is_some() && candidate_accept_ms.is_some() {
+                exit_reason = "settled";
+                break;
+            }
+        }
+        let accepted_raw_nodes;
+        if let Some(snapshot) = legacy_snapshot {
+            nodes = snapshot.nodes;
+            map = snapshot.map;
+            action_sessions = snapshot.action_sessions;
+            accepted_raw_nodes = snapshot.raw_nodes;
+        } else {
+            accepted_raw_nodes = last_raw_nodes;
         }
         if nodes.is_empty() {
             // The page never rendered (network hiccup, bot wall, JS-only
             // shell). Report it instead of returning an empty tree.
+            self.last_settle = Some(crate::observability::SettleBreakdown {
+                nav_ms,
+                poll_ms,
+                sleep_ms,
+                ax_fetch_ms,
+                compress_ms,
+                title_url_ms,
+                render_ms: 0,
+                iterations,
+                ax_fetches,
+                exit_reason: "empty".to_string(),
+                candidate_accept_ms,
+                legacy_tree_sha256: None,
+                candidate_tree_sha256: None,
+                shadow_diverged: None,
+                raw_ax_nodes: raw_ax_nodes as u64,
+                semantic_nodes: nodes.len() as u64,
+                mutation_count,
+                mutation_last_ms,
+                mutation_quiet_ms,
+                mutation_would_delay_candidate,
+            });
             self.invalidate_tree();
             return Err(CoreError::NavigationFailed(format!(
                 "page produced no accessibility content: {}",
@@ -660,17 +919,56 @@ impl BrowserSession {
         // first read happens right after `navigate`, when the new document
         // often has not been parsed yet - `document.title` is then empty
         // and the header line was blank about one page in five.
+        let t_titles_final = std::time::Instant::now();
         self.refresh_title_url().await;
+        title_url_ms += t_titles_final.elapsed().as_millis() as u64;
+        let t_render = std::time::Instant::now();
         let rendered = render(&self.title, &self.url, &nodes);
+        let render_ms = t_render.elapsed().as_millis() as u64;
+        let (legacy_tree_sha256, candidate_tree_sha256, shadow_diverged) = if shadow_enabled {
+            let legacy_hash = sha256_hex(rendered.as_bytes());
+            let candidate_hash = candidate_nodes
+                .as_ref()
+                .map(|candidate| sha256_hex(render(&self.title, &self.url, candidate).as_bytes()));
+            let diverged = candidate_hash
+                .as_ref()
+                .map(|candidate| candidate != &legacy_hash);
+            (Some(legacy_hash), candidate_hash, diverged)
+        } else {
+            (None, None, None)
+        };
+        self.last_settle = Some(crate::observability::SettleBreakdown {
+            nav_ms,
+            poll_ms,
+            sleep_ms,
+            ax_fetch_ms,
+            compress_ms,
+            title_url_ms,
+            render_ms,
+            iterations,
+            ax_fetches,
+            exit_reason: exit_reason.to_string(),
+            candidate_accept_ms,
+            legacy_tree_sha256,
+            candidate_tree_sha256,
+            shadow_diverged,
+            raw_ax_nodes: raw_ax_nodes as u64,
+            semantic_nodes: nodes.len() as u64,
+            mutation_count,
+            mutation_last_ms,
+            mutation_quiet_ms,
+            mutation_would_delay_candidate,
+        });
         self.action_map = map;
         self.action_sessions = action_sessions;
         self.last_tree = rendered.clone();
         tracing::debug!(
             ms = t_open.elapsed().as_millis(),
             nodes = nodes.len(),
+            settle = ?self.last_settle,
             "open complete"
         );
-        Ok(rendered)
+        Ok((rendered, accepted_raw_nodes))
     }
 
     /// Current action map (`ID → BackendNodeId`).
@@ -693,6 +991,11 @@ impl BrowserSession {
     /// Last rendered tree (from the most recent rebuild).
     pub fn last_tree(&self) -> &str {
         &self.last_tree
+    }
+
+    /// Timing breakdown of the most recent `open`, when one has completed.
+    pub fn last_settle(&self) -> Option<&crate::observability::SettleBreakdown> {
+        self.last_settle.as_ref()
     }
 
     /// Document title from the last navigation.
@@ -1282,4 +1585,86 @@ fn build_action_sessions(
         }
     }
     out
+}
+
+fn sha256_hex(input: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut data = input.to_vec();
+    let bit_len = (data.len() as u64).wrapping_mul(8);
+    data.push(0x80);
+    while data.len() % 64 != 56 {
+        data.push(0);
+    }
+    data.extend_from_slice(&bit_len.to_be_bytes());
+    let mut h = [
+        0x6a09e667u32,
+        0xbb67ae85,
+        0x3c6ef372,
+        0xa54ff53a,
+        0x510e527f,
+        0x9b05688c,
+        0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    for chunk in data.chunks(64) {
+        let mut w = [0u32; 64];
+        for (i, bytes) in chunk.chunks(4).take(16).enumerate() {
+            w[i] = u32::from_be_bytes(bytes.try_into().expect("four-byte word"));
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, value) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+    h.iter().map(|word| format!("{word:08x}")).collect()
+}
+
+#[cfg(test)]
+mod settle_shadow_tests {
+    #[test]
+    fn sha256_matches_standard_vector() {
+        assert_eq!(
+            super::sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }

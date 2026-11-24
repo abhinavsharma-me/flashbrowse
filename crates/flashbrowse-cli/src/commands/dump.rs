@@ -1,4 +1,4 @@
-//! `flashbrowse dump <url> --format markdown|axtree|axtree-nested|raw`.
+//! `flashbrowse dump <url> --format markdown|axtree|axtree-nested|raw|fidelity`.
 
 use std::path::PathBuf;
 
@@ -9,7 +9,8 @@ use flashbrowse_core::{
 
 use flashbrowse_core::observability;
 
-/// Emit Markdown (default), the compressed AXTree, or the raw CDP AX tree.
+/// Emit Markdown, a compressed tree, a raw CDP AX tree, or a same-open
+/// raw-and-rendered bundle for fidelity diagnostics.
 /// Format is validated BEFORE launch so a typo costs zero browsers (H7).
 pub async fn run(
     url: String,
@@ -20,10 +21,10 @@ pub async fn run(
 ) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     match format.as_str() {
-        "markdown" | "axtree" | "axtree-nested" | "raw" => {}
+        "markdown" | "axtree" | "axtree-nested" | "raw" | "fidelity" => {}
         other => {
             return Err(anyhow::anyhow!(
-                "unknown --format '{other}' (expected markdown|axtree|axtree-nested|raw)"
+                "unknown --format '{other}' (expected markdown|axtree|axtree-nested|raw|fidelity)"
             ))
         }
     }
@@ -41,10 +42,18 @@ pub async fn run(
     };
     let mut session = BrowserSession::launch(config).await?;
     let result = async {
-        let _ = session.open(&url).await?;
+        let (opened_tree, fidelity_raw) = if format == "fidelity" {
+            session.open_with_raw_snapshot(&url).await?
+        } else {
+            (session.open(&url).await?, Vec::new())
+        };
         let out = match format.as_str() {
             "markdown" => session.extract_markdown().await?,
             "axtree" if !no_prune => session.last_tree().to_string(),
+            "fidelity" => serde_json::to_string(&serde_json::json!({
+                "raw_nodes": fidelity_raw,
+                "tree": opened_tree,
+            }))?,
             "axtree" | "axtree-nested" => {
                 let raw = session.raw_ax_nodes().await?;
                 let opts = CompressOptions { prune: !no_prune };

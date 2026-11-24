@@ -182,7 +182,15 @@ pub async fn call_tool(
         "browser_screenshot" => call_screenshot(arguments, handle).await,
         other => Err(McpError::InvalidParams(format!("unknown tool '{other}'"))),
     };
-    record_tool_metric(name, arguments, &result, started);
+    // `open` is the only tool that owns a settle; read it back from the
+    // session (the handler has released the lock by now).
+    let settle = if name == "browser_open" {
+        let guard = handle.lock().await;
+        guard.as_ref().and_then(|s| s.last_settle().cloned())
+    } else {
+        None
+    };
+    record_tool_metric(name, arguments, &result, started, settle);
     result
 }
 
@@ -208,6 +216,7 @@ fn record_tool_metric(
     arguments: &Value,
     result: &Result<ToolResult, McpError>,
     started: std::time::Instant,
+    settle: Option<flashbrowse_core::observability::SettleBreakdown>,
 ) {
     use flashbrowse_core::observability;
 
@@ -227,13 +236,14 @@ fn record_tool_metric(
         Ok(tr) => (tr.is_error != Some(true), None),
         Err(e) => (false, Some(e.to_string())),
     };
-    let r = observability::record_op(
+    let r = observability::record_op_with_settle(
         &format!("mcp:{name}"),
         &target,
         started,
         Some((chars, actions)),
         ok,
         error,
+        settle,
     );
     tracing::debug!(
         tool = name,
