@@ -129,6 +129,28 @@ pub fn tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        serde_json::json!({
+            "name": "browser_fill_form",
+            "description": "Fills multiple form fields sequentially from the current action tree and returns the refreshed final tree.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "fields": {
+                        "type": "array",
+                        "description": "Ordered list of {action_id, value} entries to fill",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "action_id": {"type": "integer", "description": "Element ID from the current action tree"},
+                                "value": {"type": "string", "description": "Text value to enter"}
+                            },
+                            "required": ["action_id", "value"]
+                        }
+                    }
+                },
+                "required": ["fields"]
+            }
+        }),
     ]
 }
 
@@ -234,6 +256,7 @@ pub async fn call_tool(
         "browser_storage_state" => call_storage_state(arguments, handle, default_config).await,
         "browser_upload" => call_upload(arguments, handle, default_config).await,
         "browser_downloads" => call_downloads(arguments, handle).await,
+        "browser_fill_form" => call_fill_form(arguments, handle).await,
         other => Err(McpError::InvalidParams(format!("unknown tool '{other}'"))),
     };
     // `open` is the only tool that owns a settle; read it back from the
@@ -647,6 +670,39 @@ async fn call_downloads(arguments: &Value, handle: &SessionHandle) -> Result<Too
     Ok(ToolResult::text(
         serde_json::to_string(&result).unwrap_or_default(),
     ))
+}
+
+async fn call_fill_form(arguments: &Value, handle: &SessionHandle) -> Result<ToolResult, McpError> {
+    let raw_fields = arguments
+        .get("fields")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| McpError::InvalidParams("missing required 'fields' array".into()))?;
+    if raw_fields.is_empty() {
+        return Err(McpError::InvalidParams("'fields' must not be empty".into()));
+    }
+    let mut fields = Vec::with_capacity(raw_fields.len());
+    for item in raw_fields {
+        let action_id = arg_u32(item, "action_id")?;
+        let value = arg_string(item, "value")?;
+        fields.push((action_id, value));
+    }
+    let mut guard = handle.lock().await;
+    if guard.is_none() {
+        return Ok(ToolResult::error(
+            "no browser session: call browser_open first".to_string(),
+        ));
+    }
+    let session = guard.as_mut().expect("session present");
+    match session.fill_form(&fields).await {
+        Ok(outcome) => match outcome.failed {
+            None => Ok(ToolResult::text(outcome.tree)),
+            Some((failed_id, reason)) => Ok(ToolResult::error(format!(
+                "completed fields {:?}; stopped at field {failed_id}: {reason}\n\n{}",
+                outcome.completed, outcome.tree
+            ))),
+        },
+        Err(e) => Ok(ToolResult::error(e.to_string())),
+    }
 }
 
 async fn call_act(

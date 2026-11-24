@@ -81,7 +81,7 @@ async fn test_mcp_stdio_e2e() {
         .and_then(|r| r.get("tools"))
         .and_then(|t| t.as_array())
         .expect("tools list");
-    assert_eq!(tools.len(), 9);
+    assert_eq!(tools.len(), 10);
     let names: Vec<String> = tools
         .iter()
         .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(str::to_string))
@@ -89,6 +89,7 @@ async fn test_mcp_stdio_e2e() {
     for want in [
         "browser_open",
         "browser_act",
+        "browser_fill_form",
         "browser_extract_markdown",
         "browser_evaluate",
         "browser_screenshot",
@@ -425,6 +426,96 @@ async fn test_mcp_delayed_http_popup_and_opener_fallback() {
     drop(client_lines);
     server.await.expect("server task");
     http_task.abort();
+}
+
+#[tokio::test]
+async fn test_mcp_fill_form_and_partial_failure() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        eprintln!("SKIP: no Chromium binary found");
+        return;
+    }
+
+    let (server_in, mut client_out) = duplex(64 * 1024);
+    let (server_out, client_in) = duplex(64 * 1024);
+    let mut client_lines = BufReader::new(client_in);
+
+    let server = tokio::spawn(async move {
+        serve(server_in, server_out, SessionConfig::default())
+            .await
+            .expect("serve");
+    });
+
+    let _ = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0.1"}}
+        }),
+    )
+    .await;
+    client_out
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .unwrap();
+
+    let form_page =
+        "data:text/html,<form><input aria-label='First' /><input aria-label='Second' /></form>";
+    let open = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":form_page}}}),
+    )
+    .await;
+    assert!(tool_text(&open).contains("First"));
+
+    let filled = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({
+            "jsonrpc":"2.0","id":3,"method":"tools/call",
+            "params":{"name":"browser_fill_form","arguments":{"fields":[
+                {"action_id": 1, "value": "Ada"},
+                {"action_id": 2, "value": "Lovelace"}
+            ]}}
+        }),
+    )
+    .await;
+    assert_tool_ok(&filled);
+    let tree = tool_text(&filled);
+    assert!(tree.contains("Ada") && tree.contains("Lovelace"), "{tree}");
+
+    // Partial failure: field 1 succeeds ("Grace"), field 99 does not exist.
+    let partial = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({
+            "jsonrpc":"2.0","id":4,"method":"tools/call",
+            "params":{"name":"browser_fill_form","arguments":{"fields":[
+                {"action_id": 1, "value": "Grace"},
+                {"action_id": 99, "value": "Hopper"}
+            ]}}
+        }),
+    )
+    .await;
+    assert_eq!(
+        partial
+            .get("result")
+            .and_then(|r| r.get("isError"))
+            .and_then(Value::as_bool),
+        Some(true),
+        "expected partial failure error: {partial}"
+    );
+    let partial_text = tool_text(&partial);
+    assert!(
+        partial_text.contains("completed fields [1]"),
+        "{partial_text}"
+    );
+    assert!(partial_text.contains("Grace"), "{partial_text}");
+
+    drop(client_out);
+    drop(client_lines);
+    server.await.expect("server task");
 }
 
 #[tokio::test]

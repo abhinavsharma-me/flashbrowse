@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use flashbrowse_cdp::protocol::{accessibility, dom, network, page, runtime, target};
 use flashbrowse_cdp::CdpClient;
+use futures_util::stream::{self, StreamExt};
 use serde_json::Value;
+use tokio::sync::OnceCell;
 
 use crate::driver::FrameSession;
 use crate::interceptor;
@@ -78,41 +80,63 @@ impl CdpDriver {
 
         // Cap child frame walks so ad-heavy pages cannot stall navigation.
         const MAX_CHILD_FRAMES: usize = 32;
-        let mut cached_targets: Option<Vec<target::TargetInfo>> = None;
+        const MAX_FRAME_CONCURRENCY: usize = 4;
+        struct FetchedFrame {
+            idx: usize,
+            owner_backend: Option<i64>,
+            nodes: Vec<accessibility::AXNode>,
+            oopif_sid: Option<String>,
+        }
+        let cached_targets: OnceCell<Option<Vec<target::TargetInfo>>> = OnceCell::new();
 
-        for (idx, cf) in child_frames.into_iter().take(MAX_CHILD_FRAMES).enumerate() {
-            let owner_backend = dom::get_frame_owner(&self.client, &self.session_id, &cf.id)
-                .await
-                .ok()
-                .and_then(|r| r.backend_node_id);
+        let mut fetched: Vec<FetchedFrame> =
+            stream::iter(child_frames.into_iter().take(MAX_CHILD_FRAMES).enumerate())
+                .map(|(idx, cf)| {
+                    let cached_targets = &cached_targets;
+                    async move {
+                        let (owner_res, ax_res) = tokio::join!(
+                            dom::get_frame_owner(&self.client, &self.session_id, &cf.id),
+                            accessibility::get_full_ax_tree_for_frame(
+                                &self.client,
+                                &self.session_id,
+                                &cf.id,
+                            )
+                        );
+                        let owner_backend = owner_res.ok().and_then(|r| r.backend_node_id);
+                        let (nodes, oopif_sid) = match ax_res {
+                            Ok(resp) => (resp.nodes, None),
+                            Err(_) => self.fetch_oopif_ax_tree(&cf, cached_targets).await,
+                        };
+                        FetchedFrame {
+                            idx,
+                            owner_backend,
+                            nodes,
+                            oopif_sid,
+                        }
+                    }
+                })
+                .buffer_unordered(MAX_FRAME_CONCURRENCY)
+                .collect()
+                .await;
 
-            let (child_nodes, oopif_sid) = match accessibility::get_full_ax_tree_for_frame(
-                &self.client,
-                &self.session_id,
-                &cf.id,
-            )
-            .await
-            {
-                Ok(resp) => (resp.nodes, None),
-                Err(_) => {
-                    // Cross-process iframe (OOPIF): attach to its dedicated target.
-                    self.fetch_oopif_ax_tree(&cf, &mut cached_targets).await
-                }
-            };
-            if child_nodes.is_empty() {
+        // Restore document order regardless of which frame RPC finished first.
+        fetched.sort_by_key(|f| f.idx);
+
+        for frame in fetched {
+            if frame.nodes.is_empty() {
                 continue;
             }
-            let prefix = format!("f{}:", idx + 1);
-            if let Some(sid) = oopif_sid {
+            let prefix = format!("f{}:", frame.idx + 1);
+            if let Some(sid) = frame.oopif_sid {
                 let fs = FrameSession {
                     session_id: sid,
-                    owner_backend,
+                    owner_backend: frame.owner_backend,
                 };
-                for n in &child_nodes {
+                for n in &frame.nodes {
                     node_sessions.insert(format!("{prefix}{}", n.node_id), fs.clone());
                 }
             }
-            splice_frame_nodes(&mut all_nodes, child_nodes, &prefix, owner_backend);
+            splice_frame_nodes(&mut all_nodes, frame.nodes, &prefix, frame.owner_backend);
         }
 
         Ok((all_nodes, node_sessions))
@@ -121,15 +145,17 @@ impl CdpDriver {
     async fn fetch_oopif_ax_tree(
         &self,
         frame: &page::FrameInfo,
-        cached_targets: &mut Option<Vec<target::TargetInfo>>,
+        cached_targets: &OnceCell<Option<Vec<target::TargetInfo>>>,
     ) -> (Vec<accessibility::AXNode>, Option<String>) {
-        if cached_targets.is_none() {
-            *cached_targets = target::get_targets(&self.client)
-                .await
-                .ok()
-                .map(|r| r.target_infos);
-        }
-        let Some(targets) = cached_targets.as_ref() else {
+        let targets = cached_targets
+            .get_or_init(|| async {
+                target::get_targets(&self.client)
+                    .await
+                    .ok()
+                    .map(|r| r.target_infos)
+            })
+            .await;
+        let Some(targets) = targets.as_ref() else {
             return (Vec::new(), None);
         };
         let matched = targets
@@ -294,5 +320,47 @@ mod tests {
         // Child nodes spliced under `Iframe` (depth 1) must have depth 2.
         let inside_node = out.iter().find(|n| n.name == "Inside frame").unwrap();
         assert_eq!(inside_node.depth, 2);
+    }
+
+    #[test]
+    fn splices_multiple_frames_in_document_order_after_index_sort() {
+        let mut parent = vec![
+            ax("1", "RootWebArea", "Parent", Some(1), &["2", "3"]),
+            ax("2", "Iframe", "Frame1", Some(14), &[]),
+            ax("3", "Iframe", "Frame2", Some(15), &[]),
+        ];
+        // Simulate frame 2 finishing before frame 1, then sorted by idx.
+        let mut fetched = vec![
+            (
+                1usize,
+                Some(15i64),
+                vec![
+                    ax("1", "RootWebArea", "F2", Some(1), &["2"]),
+                    ax("2", "StaticText", "Second Frame", Some(30), &[]),
+                ],
+            ),
+            (
+                0usize,
+                Some(14i64),
+                vec![
+                    ax("1", "RootWebArea", "F1", Some(1), &["2"]),
+                    ax("2", "StaticText", "First Frame", Some(20), &[]),
+                ],
+            ),
+        ];
+        fetched.sort_by_key(|(idx, _, _)| *idx);
+        for (idx, owner_backend, child_nodes) in fetched {
+            splice_frame_nodes(
+                &mut parent,
+                child_nodes,
+                &format!("f{}:", idx + 1),
+                owner_backend,
+            );
+        }
+        let (out, _) = crate::tree::compress(&parent);
+        let rendered = crate::tree::render("Parent", "https://x", &out);
+        let first = rendered.find("First Frame").unwrap();
+        let second = rendered.find("Second Frame").unwrap();
+        assert!(first < second, "{rendered}");
     }
 }

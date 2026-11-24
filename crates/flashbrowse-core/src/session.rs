@@ -337,6 +337,17 @@ fn install_dialog_handler(
     state
 }
 
+/// Result of [`BrowserSession::fill_form`].
+#[derive(Debug, Clone)]
+pub struct FillFormOutcome {
+    /// Action IDs that were filled before completion or failure.
+    pub completed: Vec<u32>,
+    /// `(action_id, error_message)` if the batch stopped early on a field.
+    pub failed: Option<(u32, String)>,
+    /// Authoritative refreshed semantic tree after the batch.
+    pub tree: String,
+}
+
 /// Options for [`BrowserSession::screenshot`].
 #[derive(Debug, Clone)]
 pub struct ScreenshotOptions {
@@ -1689,7 +1700,8 @@ impl BrowserSession {
             .ok_or(CoreError::ActionNotFound(action_id))?;
         let (dom_sid, owner) = self.frame_for_action(action_id);
         self.click_at_backend(&dom_sid, owner, backend).await?;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        self.post_action_settle(Duration::from_millis(400)).await;
+        self.refresh_title_url().await;
         self.rebuild_tree().await
     }
 
@@ -1722,8 +1734,27 @@ impl BrowserSession {
             },
         )
         .await?;
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        self.post_action_settle(Duration::from_millis(200)).await;
         self.rebuild_tree().await
+    }
+
+    async fn fill_backend(
+        &self,
+        dom_sid: &str,
+        owner: Option<i64>,
+        backend: i64,
+        text: &str,
+    ) -> Result<(), CoreError> {
+        self.click_at_backend(dom_sid, owner, backend).await?;
+        for ev in [select_all_event(), backspace_event()] {
+            let down = ev.clone();
+            input::dispatch_key_event(&self.client, &self.session_id, &down).await?;
+            let mut up = down;
+            up.type_ = "keyUp".to_string();
+            input::dispatch_key_event(&self.client, &self.session_id, &up).await?;
+        }
+        input::insert_text(&self.client, &self.session_id, text).await?;
+        Ok(())
     }
 
     /// `fill(action_id, text)`: focus → Ctrl+A → Backspace → insert → rebuild.
@@ -1733,20 +1764,42 @@ impl BrowserSession {
             .get(&action_id)
             .ok_or(CoreError::ActionNotFound(action_id))?;
         let (dom_sid, owner) = self.frame_for_action(action_id);
-        self.click_at_backend(&dom_sid, owner, backend).await?;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Select-all (down+up) then Backspace (down+up) to clear.
-        for ev in [select_all_event(), backspace_event()] {
-            let down = ev.clone();
-            input::dispatch_key_event(&self.client, &self.session_id, &down).await?;
-            let mut up = down;
-            up.type_ = "keyUp".to_string();
-            input::dispatch_key_event(&self.client, &self.session_id, &up).await?;
-        }
-        input::insert_text(&self.client, &self.session_id, text).await?;
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.fill_backend(&dom_sid, owner, backend, text).await?;
+        self.post_action_settle(Duration::from_millis(200)).await;
         self.rebuild_tree().await
+    }
+
+    /// Fill multiple form fields sequentially from the current action map,
+    /// stopping on the first unavailable/failing field and always returning
+    /// the refreshed final tree.
+    pub async fn fill_form(
+        &mut self,
+        fields: &[(u32, String)],
+    ) -> Result<FillFormOutcome, CoreError> {
+        let mut completed = Vec::with_capacity(fields.len());
+        let mut failed = None;
+        for (action_id, value) in fields {
+            let Some(&backend) = self.action_map.get(action_id) else {
+                failed = Some((
+                    *action_id,
+                    CoreError::ActionNotFound(*action_id).to_string(),
+                ));
+                break;
+            };
+            let (dom_sid, owner) = self.frame_for_action(*action_id);
+            if let Err(err) = self.fill_backend(&dom_sid, owner, backend, value).await {
+                failed = Some((*action_id, err.to_string()));
+                break;
+            }
+            completed.push(*action_id);
+        }
+        self.post_action_settle(Duration::from_millis(250)).await;
+        let tree = self.rebuild_tree().await?;
+        Ok(FillFormOutcome {
+            completed,
+            failed,
+            tree,
+        })
     }
 
     /// `scroll(direction, amount_px)`: synthetic `mouseWheel` → rebuild.
@@ -1771,7 +1824,7 @@ impl BrowserSession {
             },
         )
         .await?;
-        tokio::time::sleep(Duration::from_millis(250)).await;
+        self.post_action_settle(Duration::from_millis(300)).await;
         self.rebuild_tree().await
     }
 
@@ -1810,7 +1863,7 @@ impl BrowserSession {
         if !outcome.starts_with("ok:") {
             tracing::warn!(action_id, text, outcome, "select failed");
         }
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        self.post_action_settle(Duration::from_millis(200)).await;
         self.rebuild_tree().await
     }
 
@@ -1834,7 +1887,8 @@ impl BrowserSession {
         let mut up = params;
         up.type_ = "keyUp".to_string();
         input::dispatch_key_event(&self.client, &self.session_id, &up).await?;
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        self.post_action_settle(Duration::from_millis(250)).await;
+        self.refresh_title_url().await;
         self.rebuild_tree().await
     }
 
@@ -2030,6 +2084,31 @@ impl BrowserSession {
         }
     }
 
+    /// Wait for post-action page activity (in-flight network + DOM stability)
+    /// instead of a hardcoded sleep.
+    async fn post_action_settle(&self, max_wait: Duration) {
+        let deadline = tokio::time::Instant::now() + max_wait;
+        let mut prev_state: Option<String> = None;
+        loop {
+            let state = self
+                .driver
+                .evaluate("`${document.readyState}|${document.getElementsByTagName('*').length}|${document.body ? document.body.innerText.length : 0}`")
+                .await
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string));
+            let net_quiet = self.net.idle(30);
+            let ready = state.as_deref().is_some_and(|s| s.starts_with("complete|"));
+            if net_quiet && ready && prev_state.is_some() && prev_state == state {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            prev_state = state;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
     /// Wait until `backend` is visible + stable (actionability check -
     /// Playwright-parity, beats fixed-sleep clicking). Polls box center;
     /// stable = same center twice in a row, visible = center inside viewport.
@@ -2055,7 +2134,7 @@ impl BrowserSession {
                     if tokio::time::Instant::now() >= deadline {
                         return Err(e.into());
                     }
-                    tokio::time::sleep(Duration::from_millis(80)).await;
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                     continue;
                 }
             };
@@ -2084,7 +2163,7 @@ impl BrowserSession {
                 // Fall back to last observed center (best-effort, never hang).
                 return Ok(center);
             }
-            tokio::time::sleep(Duration::from_millis(80)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
     }
 
