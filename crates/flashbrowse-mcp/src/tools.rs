@@ -93,6 +93,18 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["action"]
             }
         }),
+        serde_json::json!({
+            "name": "browser_storage_state",
+            "description": "Imports or exports browser cookies and per-origin localStorage to a named JSON file confined to the configured storage-state root.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["import", "export"]},
+                    "name": {"type": "string", "description": "Simple file name without a path or extension"}
+                },
+                "required": ["action", "name"]
+            }
+        }),
     ]
 }
 
@@ -195,6 +207,7 @@ pub async fn call_tool(
         "browser_evaluate" => call_evaluate(arguments, handle).await,
         "browser_screenshot" => call_screenshot(arguments, handle).await,
         "browser_tabs" => call_tabs(arguments, handle, default_config).await,
+        "browser_storage_state" => call_storage_state(arguments, handle, default_config).await,
         other => Err(McpError::InvalidParams(format!("unknown tool '{other}'"))),
     };
     // `open` is the only tool that owns a settle; read it back from the
@@ -415,6 +428,83 @@ async fn call_tabs(
         }
         _ => Err(McpError::InvalidParams(
             "action must be list, select, or close".into(),
+        )),
+    }
+}
+
+fn storage_state_path(config: &SessionConfig, name: &str) -> Result<std::path::PathBuf, McpError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || name.ends_with(".json")
+    {
+        return Err(McpError::InvalidParams(
+            "name must be a simple file name without a path or extension".into(),
+        ));
+    }
+    let root = config
+        .storage_state_root
+        .clone()
+        .unwrap_or_else(|| flashbrowse_core::paths::cache_dir().join("storage-state"));
+    std::fs::create_dir_all(&root).map_err(|error| McpError::Internal(error.to_string()))?;
+    let root =
+        std::fs::canonicalize(&root).map_err(|error| McpError::Internal(error.to_string()))?;
+    let path = root.join(format!("{name}.json"));
+    if path.exists() {
+        let canonical =
+            std::fs::canonicalize(&path).map_err(|error| McpError::Internal(error.to_string()))?;
+        if !canonical.starts_with(&root) {
+            return Err(McpError::InvalidParams(
+                "storage-state file resolves outside the configured root".into(),
+            ));
+        }
+    }
+    Ok(path)
+}
+
+async fn call_storage_state(
+    arguments: &Value,
+    handle: &SessionHandle,
+    config: &SessionConfig,
+) -> Result<ToolResult, McpError> {
+    let action = arg_string(arguments, "action")?;
+    let name = arg_string(arguments, "name")?;
+    let path = storage_state_path(config, &name)?;
+    let mut guard = handle.lock().await;
+    let session = require_session(&mut guard)?;
+    match action.as_str() {
+        "export" => {
+            let state = session
+                .export_storage_state()
+                .await
+                .map_err(|error| McpError::Internal(error.to_string()))?;
+            let encoded = serde_json::to_vec_pretty(&state)
+                .map_err(|error| McpError::Internal(error.to_string()))?;
+            tokio::fs::write(&path, encoded)
+                .await
+                .map_err(|error| McpError::Internal(error.to_string()))?;
+            Ok(ToolResult::text(format!(
+                "Storage state exported as {name}"
+            )))
+        }
+        "import" => {
+            let encoded = tokio::fs::read(&path).await.map_err(|error| {
+                McpError::InvalidParams(format!("cannot read storage state: {error}"))
+            })?;
+            let state: Value = serde_json::from_slice(&encoded).map_err(|error| {
+                McpError::InvalidParams(format!("invalid storage-state JSON: {error}"))
+            })?;
+            session
+                .import_storage_state(&state)
+                .await
+                .map(ToolResult::text)
+                .map_err(|error| McpError::Internal(error.to_string()))
+        }
+        _ => Err(McpError::InvalidParams(
+            "action must be import or export".into(),
         )),
     }
 }
@@ -651,5 +741,16 @@ mod tests {
     fn allowlist_still_rejects_other_schemes() {
         // A scheme the allowlist does not know, with a host, is refused.
         assert!(resolve_mcp_url("ftp://example.com").is_err());
+    }
+
+    #[test]
+    fn storage_state_names_cannot_escape_root() {
+        let config = SessionConfig {
+            storage_state_root: Some(std::env::temp_dir().join("flashbrowse-storage-test")),
+            ..Default::default()
+        };
+        assert!(storage_state_path(&config, "../outside").is_err());
+        assert!(storage_state_path(&config, "nested/name").is_err());
+        assert!(storage_state_path(&config, "valid-state").is_ok());
     }
 }

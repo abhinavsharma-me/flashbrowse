@@ -50,6 +50,9 @@ pub enum CdpError {
         method: String,
     },
 
+    #[error("invalid CDP endpoint {endpoint}: {detail}")]
+    InvalidCdpEndpoint { endpoint: String, detail: String },
+
     #[error("CDP socket disconnected while awaiting response for {method}")]
     Disconnected {
         /// Method that was in flight.

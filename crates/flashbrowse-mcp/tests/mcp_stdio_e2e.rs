@@ -81,7 +81,7 @@ async fn test_mcp_stdio_e2e() {
         .and_then(|r| r.get("tools"))
         .and_then(|t| t.as_array())
         .expect("tools list");
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 7);
     let names: Vec<String> = tools
         .iter()
         .filter_map(|t| t.get("name").and_then(|v| v.as_str()).map(str::to_string))
@@ -93,6 +93,7 @@ async fn test_mcp_stdio_e2e() {
         "browser_evaluate",
         "browser_screenshot",
         "browser_tabs",
+        "browser_storage_state",
     ] {
         assert!(names.contains(&want.to_string()), "missing tool {want}");
     }
@@ -422,6 +423,122 @@ async fn test_mcp_delayed_http_popup_and_opener_fallback() {
     drop(client_lines);
     server.await.expect("server task");
     http_task.abort();
+}
+
+#[tokio::test]
+async fn test_mcp_storage_state_import_export() {
+    if flashbrowse_cdp::find_chrome(None).is_err() {
+        eprintln!("SKIP: no Chromium binary found");
+        return;
+    }
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let root = std::env::temp_dir().join(format!(
+        "flashbrowse-storage-state-test-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("create storage-state root");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind local test server");
+    let port = listener.local_addr().unwrap().port();
+    let url = format!("http://127.0.0.1:{port}/state");
+    let http_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let body = "<html><body><h1>Storage State</h1></body></html>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                );
+                let _ = sock.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let state = serde_json::json!({
+        "cookies": [{"name": "auth", "value": "cookie-value", "domain": "127.0.0.1", "path": "/", "expires": -1, "httpOnly": false, "secure": false, "sameSite": "Lax"}],
+        "origins": [{"origin": format!("http://127.0.0.1:{port}"), "localStorage": [{"name": "token", "value": "storage-value"}]}]
+    });
+    std::fs::write(root.join("state.json"), serde_json::to_vec(&state).unwrap())
+        .expect("write fixture state");
+
+    let (server_in, mut client_out) = duplex(64 * 1024);
+    let (server_out, client_in) = duplex(64 * 1024);
+    let mut client_lines = BufReader::new(client_in);
+    let config = SessionConfig {
+        storage_state_root: Some(root.clone()),
+        ..Default::default()
+    };
+    let server = tokio::spawn(async move {
+        serve(server_in, server_out, config).await.expect("serve");
+    });
+    let _ = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0.1"}}}),
+    )
+    .await;
+    client_out
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n")
+        .await
+        .unwrap();
+    let opened = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"browser_open","arguments":{"url":url}}}),
+    )
+    .await;
+    assert!(tool_text(&opened).contains("Storage State"), "{opened}");
+    let imported = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"browser_storage_state","arguments":{"action":"import","name":"state"}}}),
+    )
+    .await;
+    assert!(tool_text(&imported).contains("Storage State"), "{imported}");
+    let evaluated = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"browser_evaluate","arguments":{"expression":"[document.cookie, localStorage.getItem('token')]"}}}),
+    )
+    .await;
+    assert!(
+        tool_text(&evaluated).contains("cookie-value"),
+        "cookie was not imported: {evaluated}"
+    );
+    assert!(
+        tool_text(&evaluated).contains("storage-value"),
+        "localStorage was not imported before page scripts: {evaluated}"
+    );
+    let exported = roundtrip(
+        &mut client_out,
+        &mut client_lines,
+        serde_json::json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"browser_storage_state","arguments":{"action":"export","name":"roundtrip"}}}),
+    )
+    .await;
+    assert!(tool_text(&exported).contains("exported"), "{exported}");
+    let exported_state: Value =
+        serde_json::from_slice(&std::fs::read(root.join("roundtrip.json")).unwrap()).unwrap();
+    assert!(exported_state["cookies"]
+        .as_array()
+        .is_some_and(|cookies| cookies.iter().any(|cookie| cookie["name"] == "auth")));
+    assert!(exported_state["origins"]
+        .as_array()
+        .is_some_and(|origins| origins.iter().any(|origin| origin["localStorage"]
+            .as_array()
+            .is_some_and(|items| items
+                .iter()
+                .any(|item| item["name"] == "token" && item["value"] == "storage-value")))));
+
+    drop(client_out);
+    drop(client_lines);
+    server.await.expect("MCP server");
+    http_task.abort();
+    let _ = std::fs::remove_dir_all(root);
 }
 
 fn tool_text(resp: &Value) -> String {

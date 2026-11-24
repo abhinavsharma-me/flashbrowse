@@ -8,10 +8,16 @@ use flashbrowse_core::{ResourcePolicy, SessionConfig};
 pub async fn run(
     chrome_path: Option<PathBuf>,
     resource_policy: ResourcePolicy,
+    cdp_url: Option<String>,
+    user_data_dir: Option<PathBuf>,
+    storage_state_root: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let config = SessionConfig {
         chrome_path,
         resource_policy,
+        cdp_url,
+        user_data_dir,
+        storage_state_root,
         ..Default::default()
     };
     flashbrowse_mcp::serve_stdio(config)

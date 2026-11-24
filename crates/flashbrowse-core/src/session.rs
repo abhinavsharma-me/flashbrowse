@@ -58,6 +58,12 @@ pub struct SessionConfig {
     pub persistent: bool,
     /// Default disposition for native JavaScript dialogs.
     pub dialog_policy: DialogPolicy,
+    /// Use an existing Chrome profile when launching a managed browser.
+    pub user_data_dir: Option<PathBuf>,
+    /// Attach to an existing Chrome debugging endpoint instead of launching.
+    pub cdp_url: Option<String>,
+    /// Root directory allowed for MCP storage-state files.
+    pub storage_state_root: Option<PathBuf>,
 }
 
 /// Native JavaScript dialog handling policy.
@@ -94,6 +100,11 @@ impl SessionConfig {
                 "{} (chrome only today)",
                 self.engine.as_str()
             )));
+        }
+        if self.cdp_url.is_some() && self.user_data_dir.is_some() {
+            return Err(CoreError::NavigationFailed(
+                "--cdp-url and --user-data-dir cannot be used together".into(),
+            ));
         }
         Ok(())
     }
@@ -150,15 +161,12 @@ fn install_dialog_handler(
                 };
                 (accepted, prompt_text)
             };
+            let mut params = serde_json::json!({"accept": accepted});
+            if let Some(prompt_text) = prompt_text {
+                params["promptText"] = Value::String(prompt_text);
+            }
             let response: Result<Value, CdpError> = client
-                .send(
-                    Some(&session_id),
-                    "Page.handleJavaScriptDialog",
-                    serde_json::json!({
-                        "accept": accepted,
-                        "promptText": prompt_text,
-                    }),
-                )
+                .send(Some(&session_id), "Page.handleJavaScriptDialog", params)
                 .await;
             match response {
                 Ok(_) => {
@@ -347,11 +355,16 @@ impl BrowserSession {
     /// Launch Chromium, attach, apply stealth + network filtering.
     pub async fn launch(config: SessionConfig) -> Result<Self, CoreError> {
         config.validate_engine()?;
+        if let Some(endpoint) = config.cdp_url.as_deref() {
+            let ws_url =
+                flashbrowse_cdp::protocol::browser::resolve_websocket_url(endpoint).await?;
+            return Self::attach(ws_url, None, &config).await;
+        }
         let chrome = flashbrowse_cdp::launch_chrome(LaunchOptions {
             chrome_path: config.chrome_path.clone(),
             extra_args: config.extra_args.clone(),
             no_sandbox: config.no_sandbox,
-            user_data_dir: None,
+            user_data_dir: config.user_data_dir.clone(),
             window_size: (1280, 800),
             persistent: config.persistent,
         })
@@ -1189,6 +1202,76 @@ impl BrowserSession {
             .lock()
             .ok()
             .and_then(|mut state| state.last_dialog.take())
+    }
+
+    /// Export Playwright-compatible cookies and per-origin localStorage.
+    pub async fn export_storage_state(&self) -> Result<Value, CoreError> {
+        let cookies: Value = self
+            .client
+            .send(
+                Some(&self.session_id),
+                "Network.getAllCookies",
+                serde_json::json!({}),
+            )
+            .await?;
+        let page_state = runtime::evaluate(
+            &self.client,
+            &self.session_id,
+            "JSON.stringify({origin: location.origin, localStorage: Object.entries(localStorage).map(([name, value]) => ({name, value}))})",
+        )
+        .await?;
+        let origin_state = page_state
+            .result
+            .value
+            .as_ref()
+            .and_then(Value::as_str)
+            .and_then(|encoded| serde_json::from_str::<Value>(encoded).ok())
+            .filter(|value| {
+                value
+                    .get("origin")
+                    .and_then(Value::as_str)
+                    .is_some_and(|o| o != "null")
+            });
+        Ok(serde_json::json!({
+            "cookies": cookies.get("cookies").cloned().unwrap_or_else(|| Value::Array(Vec::new())),
+            "origins": origin_state.into_iter().collect::<Vec<_>>(),
+        }))
+    }
+
+    /// Apply cookies and arrange localStorage restoration before page scripts,
+    /// then reload the current document so the imported state takes effect.
+    pub async fn import_storage_state(&mut self, state: &Value) -> Result<String, CoreError> {
+        let cookies = state
+            .get("cookies")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                CoreError::NavigationFailed("storage state must contain a cookies array".into())
+            })?;
+        let origins = state
+            .get("origins")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                CoreError::NavigationFailed("storage state must contain an origins array".into())
+            })?;
+        let _: Value = self
+            .client
+            .send(
+                Some(&self.session_id),
+                "Network.setCookies",
+                serde_json::json!({"cookies": cookies}),
+            )
+            .await?;
+        let encoded_origins = serde_json::to_string(origins)?;
+        let script = format!(
+            "(() => {{ const states = {encoded_origins}; const state = states.find(item => item.origin === location.origin); if (state && Array.isArray(state.localStorage)) {{ for (const item of state.localStorage) localStorage.setItem(item.name, item.value); }} }})()"
+        );
+        page::add_script_on_new_document(&self.client, &self.session_id, &script).await?;
+        let current_url = if self.url.is_empty() {
+            "about:blank".to_string()
+        } else {
+            self.url.clone()
+        };
+        self.open(&current_url).await
     }
 
     pub async fn list_tabs(&self) -> Result<Vec<target::TargetInfo>, CoreError> {

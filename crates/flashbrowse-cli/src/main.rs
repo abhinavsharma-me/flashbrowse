@@ -68,7 +68,17 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Commands {
     /// Start the Model Context Protocol stdio server for AI agents.
-    Mcp,
+    Mcp {
+        /// Attach to an existing Chrome debugging endpoint instead of launching.
+        #[arg(long, conflicts_with = "user_data_dir")]
+        cdp_url: Option<String>,
+        /// Launch Chrome with this profile directory.
+        #[arg(long)]
+        user_data_dir: Option<PathBuf>,
+        /// Confine MCP browser storage-state files to this directory.
+        #[arg(long)]
+        storage_state_root: Option<PathBuf>,
+    },
     /// Open a URL and display the token-compressed action tree.
     Open {
         /// Target URL. The scheme may be omitted: https is assumed, and local
@@ -77,6 +87,12 @@ enum Commands {
         /// Keep the browser alive for `act` (session id).
         #[arg(long)]
         session_id: Option<String>,
+        /// Attach to an existing Chrome debugging endpoint instead of launching.
+        #[arg(long, conflicts_with = "user_data_dir")]
+        cdp_url: Option<String>,
+        /// Launch Chrome with this profile directory.
+        #[arg(long)]
+        user_data_dir: Option<PathBuf>,
     },
     /// Execute a direct action against a persistent tab session.
     Act {
@@ -221,9 +237,35 @@ async fn main() -> anyhow::Result<()> {
 
     let run = async {
         match cli.command {
-            Commands::Mcp => commands::mcp::run(cli.chrome_path, resource_policy).await,
-            Commands::Open { url, session_id } => {
-                commands::open::run(url, session_id, cli.chrome_path, resource_policy).await
+            Commands::Mcp {
+                cdp_url,
+                user_data_dir,
+                storage_state_root,
+            } => {
+                commands::mcp::run(
+                    cli.chrome_path,
+                    resource_policy,
+                    cdp_url,
+                    user_data_dir,
+                    storage_state_root,
+                )
+                .await
+            }
+            Commands::Open {
+                url,
+                session_id,
+                cdp_url,
+                user_data_dir,
+            } => {
+                commands::open::run(
+                    url,
+                    session_id,
+                    cli.chrome_path,
+                    resource_policy,
+                    cdp_url,
+                    user_data_dir,
+                )
+                .await
             }
             Commands::Act {
                 action_id,
@@ -307,7 +349,7 @@ async fn main() -> anyhow::Result<()> {
 /// Stable operation name for logs and metrics.
 fn command_op_name(cmd: &Commands) -> String {
     match cmd {
-        Commands::Mcp => "mcp".into(),
+        Commands::Mcp { .. } => "mcp".into(),
         Commands::Open { .. } => "open".into(),
         Commands::Act { action, .. } => format!("act:{action}"),
         Commands::Dump { format, .. } => format!("dump:{format}"),

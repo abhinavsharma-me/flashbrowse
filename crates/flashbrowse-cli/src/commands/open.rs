@@ -13,6 +13,8 @@ pub async fn run(
     session_id: Option<String>,
     chrome_path: Option<PathBuf>,
     resource_policy: ResourcePolicy,
+    cdp_url: Option<String>,
+    user_data_dir: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let started = std::time::Instant::now();
     // Resolve before launching: a typo must not cost a browser, and the raw
@@ -33,6 +35,8 @@ pub async fn run(
         chrome_path,
         resource_policy,
         persistent: session_id.is_some(),
+        cdp_url,
+        user_data_dir,
         ..Default::default()
     };
     let mut session = BrowserSession::launch(config).await?;
