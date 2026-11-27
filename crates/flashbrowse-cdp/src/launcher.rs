@@ -545,14 +545,14 @@ async fn launch_chrome_pipe(opts: &LaunchOptions) -> Result<ChromeProcess, CdpEr
         .stdin(Stdio::null())
         .kill_on_drop(true);
 
-    let persistent = opts.persistent;
+    let _persistent = opts.persistent;
     unsafe {
         command.pre_exec(move || {
             if libc::setpgid(0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             #[cfg(target_os = "linux")]
-            if !persistent && libc::prctl(1, libc::SIGKILL as libc::c_int, 0, 0, 0) != 0 {
+            if !_persistent && libc::prctl(1, libc::SIGKILL as libc::c_int, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             if libc::dup2(child_read_fd, 3) < 0 {
